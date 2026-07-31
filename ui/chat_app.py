@@ -222,6 +222,22 @@ def human_tier(tier: Tier) -> str:
     return tier.value.replace("tier", "Tier ")
 
 
+def external_link(url: str, text: str) -> str:
+    """Opens in a new tab — clicking a same-tab link would navigate away
+    from the app and lose the whole conversation's session state."""
+    return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{text}</a>'
+
+
+def servicenow_request_url(request_sys_id: str) -> str | None:
+    instance_url = os.getenv("SN_INSTANCE_URL", "")
+    return f"{instance_url}/sc_request.do?sys_id={request_sys_id}" if instance_url else None
+
+
+def servicenow_link_or_bold(reference: str, request_sys_id: str) -> str:
+    url = servicenow_request_url(request_sys_id)
+    return external_link(url, reference) if url else f"<strong>{reference}</strong>"
+
+
 # ---- conversation state helpers --------------------------------------------------
 
 def init_state() -> None:
@@ -422,15 +438,13 @@ def handle_confirm(yes: bool, catalog: EntitlementCatalog) -> None:
         st.session_state.conv_step = "confirm"
         return
 
-    instance_url = os.getenv("SN_INSTANCE_URL", "")
-    request_link = f"{instance_url}/sc_request.do?sys_id={result.approval.request_sys_id}" if instance_url else None
-    approval_ref = f"[{result.approval.reference}]({request_link})" if request_link else f"**{result.approval.reference}**"
+    approval_ref = servicenow_link_or_bold(result.approval.reference, result.approval.request_sys_id)
 
     content = (
         f"**🟡 Passed policy checks — sent for human approval.** Nothing has been granted yet.\n\n"
-        f"Request {approval_ref} is now waiting in ServiceNow. **No pull request has been opened "
-        "yet** — one will only be raised once a human approves this in ServiceNow, so a declined "
-        "request never leaves a proposed change sitting on GitHub.\n\n"
+        f"Request {approval_ref} is now waiting in ServiceNow (opens in a new tab). **No pull "
+        "request has been opened yet** — one will only be raised once a human approves this in "
+        "ServiceNow, so a declined request never leaves a proposed change sitting on GitHub.\n\n"
         "Use \"Refresh pipeline status\" below to check — I'll open the PR automatically the moment "
         "it's approved, and offer to merge it for you."
     )
@@ -442,8 +456,9 @@ def handle_confirm(yes: bool, catalog: EntitlementCatalog) -> None:
 
 def render_technical_details(result) -> None:
     with st.expander("🔧 Technical details (for platform / audit team)"):
+        sn_ref = servicenow_link_or_bold(result.approval.reference, result.approval.request_sys_id)
         pr_line = (
-            f"- Pull request: [#{result.pull_request.number}]({result.pull_request.html_url}) "
+            f"- Pull request: {external_link(result.pull_request.html_url, f'#{result.pull_request.number}')} "
             f"(branch `{result.pull_request.branch}`)\n"
             if result.pull_request
             else f"- Pull request: not yet raised — will open on branch `{result.branch_name}` once approved\n"
@@ -452,11 +467,12 @@ def render_technical_details(result) -> None:
             f"- Policy check: `{', '.join(result.policy_decision.policy_ids)}`\n"
             f"- Catalog entry: `{result.entitlement.catalog_entry_id}`\n"
             f"- Resource: `{result.entitlement.resource_id}` ({result.entitlement.resource_type})\n"
-            f"- ServiceNow request: `{result.approval.reference}` "
+            f"- ServiceNow request: {sn_ref} "
             f"(request sys_id `{result.approval.request_sys_id}`, "
             f"approval sys_id `{result.approval.approval_sys_id}`, state at creation `{result.approval.state}`)\n"
             f"{pr_line}"
-            f"- Expires (UTC): `{result.expires_at.isoformat()}`"
+            f"- Expires (UTC): `{result.expires_at.isoformat()}`",
+            unsafe_allow_html=True,
         )
         st.code(result.iac_diff, language="hcl")
 
@@ -466,28 +482,30 @@ def render_pipeline_steps(message: dict) -> None:
     approval_state = message.get("last_checked_approval")
     pr_state = message.get("last_checked_pr")
     build = message.get("last_checked_build")
+    sn_ref = servicenow_link_or_bold(result.approval.reference, result.approval.request_sys_id)
 
     lines = ["**Pipeline status:**", "1. ✅ Policy check — passed"]
 
     if message.get("rejected"):
         rejected_label = APPROVAL_STATE_LABELS.get(approval_state, f"❌ {approval_state}")
-        lines.append(f"2. {rejected_label} — ServiceNow request `{result.approval.reference}`")
+        lines.append(f"2. {rejected_label} — ServiceNow request {sn_ref}")
         lines.append("3. ⚪ No pull request was raised — a declined request never reaches GitHub")
         lines.append("4. ⚪ Nothing to apply")
-        st.markdown("\n".join(lines))
+        st.markdown("\n".join(lines), unsafe_allow_html=True)
         return
 
     approval_label = APPROVAL_STATE_LABELS.get(approval_state, "⚪ Not checked yet") if approval_state else "⚪ Not checked yet"
-    lines.append(f"2. {approval_label} — ServiceNow request `{result.approval.reference}`")
+    lines.append(f"2. {approval_label} — ServiceNow request {sn_ref}")
 
     if result.pull_request is None:
         lines.append("3. ⚪ Not raised yet — opens automatically once approved")
         lines.append("4. ⚪ Waiting on approval, then PR merge, before the pipeline can apply")
-        st.markdown("\n".join(lines))
+        st.markdown("\n".join(lines), unsafe_allow_html=True)
         return
 
+    pr_link = external_link(result.pull_request.html_url, f"PR #{result.pull_request.number}")
     pr_label = PR_STATE_LABELS.get(pr_state, "⚪ Not checked yet") if pr_state else "⚪ Not checked yet"
-    lines.append(f"3. {pr_label} — [PR #{result.pull_request.number}]({result.pull_request.html_url})")
+    lines.append(f"3. {pr_label} — {pr_link}")
 
     if pr_state != "merged":
         lines.append("4. ⚪ Waiting on PR merge before the pipeline can apply")
@@ -495,13 +513,18 @@ def render_pipeline_steps(message: dict) -> None:
         lines.append("4. 🟡 Merged — GitHub Actions run not found yet (may take a few seconds to start)")
     else:
         build_label = BUILD_STATUS_LABELS.get(build.status, build.status)
-        lines.append(f"4. {build_label} — [GitHub Actions run]({build.log_url})")
+        build_link = external_link(build.log_url, "GitHub Actions run")
+        lines.append(f"4. {build_label} — {build_link}")
 
-    st.markdown("\n".join(lines))
+    st.markdown("\n".join(lines), unsafe_allow_html=True)
 
 
 def render_result_turn(message: dict, index: int) -> None:
-    st.markdown(message["content"])
+    # unsafe_allow_html is scoped to this bot-generated content only (it
+    # embeds a ServiceNow link) — the plain user/bot text turns in
+    # render_turn deliberately never get it, since those can contain raw
+    # user-typed text (email, justification) and must not be interpreted as HTML.
+    st.markdown(message["content"], unsafe_allow_html=True)
     result = message["result"]
     render_technical_details(result)
     render_pipeline_steps(message)
