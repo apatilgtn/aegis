@@ -23,7 +23,7 @@ entries:
     environment: nonprod
     tier: tier2
     resource_type: iam_binding
-    resource_id: "roles/payments.nonprod.tier2Access"
+    resource_id: "roles/editor"  # real GCP predefined role — standard/edit access
     display_name: "Payments Non-Prod — Tier 2 Access"
     max_ttl_hours: 24
     terraform_module: "modules/gcp/iam_binding"
@@ -45,7 +45,7 @@ entries:
     environment: nonprod
     tier: tier1
     resource_type: iam_binding
-    resource_id: "roles/payments.nonprod.tier1ReadOnly"
+    resource_id: "roles/viewer"  # real GCP predefined role — read-only access
     display_name: "Payments Non-Prod — Tier 1 Access (read-only)"
     max_ttl_hours: 72
     terraform_module: "modules/gcp/iam_binding"

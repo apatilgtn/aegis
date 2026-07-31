@@ -1,0 +1,53 @@
+name: Terraform apply (GCP)
+
+# Runs on push to main — i.e. after a human has approved the change in
+# ServiceNow AND merged the PR (two independent human gates upstream of
+# this workflow). This is the only place `terraform apply` runs against
+# real cloud infrastructure. Authenticates to GCP via Workload Identity
+# Federation — no service account key stored anywhere.
+#
+# Cloud-agnostic by structure, not just intent: this job authenticates to
+# GCP and runs the GCP root module. A future Azure (or any other cloud)
+# job would follow the same shape — checkout, cloud-specific OIDC auth
+# step, terraform init/plan/apply in that cloud's root module directory —
+# added as another job in this same workflow, not a different pipeline.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/access-grants/**"
+      - ".github/workflows/terraform-apply.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  gcp-apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ual-demo-af168
+          workload_identity_provider: "projects/225619639749/locations/global/workloadIdentityPools/aegis-github-pool/providers/aegis-github-provider"
+          service_account: "aegis-pipeline@ual-demo-af168.iam.gserviceaccount.com"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: terraform init
+        working-directory: infra/access-grants
+        run: terraform init
+
+      - name: terraform plan
+        working-directory: infra/access-grants
+        run: terraform plan -out=tfplan
+
+      - name: terraform apply
+        working-directory: infra/access-grants
+        run: terraform apply -auto-approve tfplan

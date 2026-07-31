@@ -2,8 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from agents.access_grant_agent import AccessGrantDenied, AlreadyGrantedError, check_approval_status, handle_access_grant
-from contracts.capability_contract import AccessGrantRequest, Cloud, Environment, Tier
+from agents.access_grant_agent import (
+    AccessGrantDenied,
+    AlreadyGrantedError,
+    check_approval_status,
+    check_pull_request_status,
+    handle_access_grant,
+)
+from contracts.capability_contract import AccessGrantRequest, Cloud, Environment, PullRequestRef, Tier
 from contracts.entitlement_catalog import EntitlementCatalog, EntitlementNotFoundError
 from mcp_servers.azure_entra.directory_service import PrincipalNotFoundError
 from mcp_servers.gcp_resource_manager.project_service import resolve_project
@@ -27,6 +33,18 @@ def stub_servicenow(monkeypatch):
         )
 
     monkeypatch.setattr("agents.access_grant_agent.create_access_request", fake_create_access_request)
+
+
+@pytest.fixture(autouse=True)
+def stub_github(monkeypatch):
+    """The real client is verified separately via a live call (see
+    mcp_servers/github/client.py) — unit tests must not open real PRs on
+    every run."""
+
+    def fake_open_access_grant_pr(**kwargs):
+        return PullRequestRef(number=9999, html_url="https://github.com/example/repo/pull/9999", branch="fake-branch")
+
+    monkeypatch.setattr("agents.access_grant_agent.open_access_grant_pr", fake_open_access_grant_pr)
 
 
 @pytest.fixture(scope="module")
@@ -64,7 +82,7 @@ def test_allowed_request_produces_gcp_terraform_diff(catalog, valid_request):
     assert result.entitlement.cloud == Cloud.GCP
     assert result.entitlement.catalog_entry_id == "gcp-payments-nonprod-tier2"
     assert 'source  = "../../modules/gcp/iam_binding"' in result.iac_diff
-    assert "roles/payments.nonprod.tier2Access" in result.iac_diff
+    assert "roles/editor" in result.iac_diff
     assert resolve_project("payments") in result.iac_diff  # resolved GCP project
 
 
@@ -112,3 +130,14 @@ def test_check_approval_status_polls_the_approval_task_not_the_request(catalog, 
     )
 
     assert check_approval_status(result.approval) == "approved"
+
+
+def test_check_pull_request_status_polls_the_pr_number(catalog, valid_request, monkeypatch):
+    result = handle_access_grant(valid_request, Cloud.AZURE, catalog)
+
+    monkeypatch.setattr(
+        "agents.access_grant_agent.get_pull_request_state",
+        lambda pr_number: "merged" if pr_number == 9999 else "wrong-pr-used",
+    )
+
+    assert check_pull_request_status(result.pull_request) == "merged"

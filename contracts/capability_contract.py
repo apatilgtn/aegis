@@ -49,6 +49,14 @@ class EntitlementRef(BaseModel):
     display_name: str = Field(description="Human-readable label from the catalog, for consumer-facing UI")
 
 
+class PullRequestRef(BaseModel):
+    """The Git PR carrying the proposed Terraform diff — never merged by the agent itself."""
+
+    number: int
+    html_url: str
+    branch: str
+
+
 class ApprovalRef(BaseModel):
     """The ITSM approval record raised for a proposed change — never the change itself.
 
@@ -81,9 +89,10 @@ class AccessGrantRequest(BaseModel):
 class AccessGrantResult(BaseModel):
     capability: Literal["access_grant"] = "access_grant"
     entitlement: EntitlementRef
-    iac_diff: str = Field(description="Terraform HCL diff to be opened as a PR")
+    iac_diff: str = Field(description="Terraform HCL diff opened as a PR")
     policy_decision: PolicyDecision
     approval: ApprovalRef
+    pull_request: PullRequestRef
     expires_at: datetime
 
 

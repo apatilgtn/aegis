@@ -38,6 +38,7 @@ from agents.access_grant_agent import (
     AlreadyGrantedError,
     ApprovalRequestFailed,
     check_approval_status,
+    check_pipeline_status,
     handle_access_grant,
 )
 from contracts.capability_contract import AccessGrantRequest, Cloud, Environment, Tier
@@ -239,6 +240,8 @@ def render_technical_details(result) -> None:
             f"- ServiceNow request: `{result.approval.reference}` "
             f"(request sys_id `{result.approval.request_sys_id}`, "
             f"approval sys_id `{result.approval.approval_sys_id}`, state at creation `{result.approval.state}`)\n"
+            f"- Pull request: [#{result.pull_request.number}]({result.pull_request.html_url}) "
+            f"(branch `{result.pull_request.branch}`)\n"
             f"- Expires (UTC): `{result.expires_at.isoformat()}`"
         )
         st.code(result.iac_diff, language="hcl")
@@ -253,7 +256,9 @@ def compute_assistant_record(prompt: str, requester: str, cloud: Cloud, catalog:
         "caption": None,
         "result": None,
         "technical_error": None,
-        "last_checked_state": None,
+        "last_checked_approval": None,
+        "last_checked_pr": None,
+        "last_checked_build": None,
     }
     parsed = None
     try:
@@ -281,15 +286,14 @@ def compute_assistant_record(prompt: str, requester: str, cloud: Cloud, catalog:
         request_link = (
             f"{instance_url}/sc_request.do?sys_id={result.approval.request_sys_id}" if instance_url else None
         )
-        approval_line = f"Request **{result.approval.reference}** is now waiting in ServiceNow for a human to approve."
+        approval_line = f"Request **{result.approval.reference}**"
         if request_link:
-            approval_line = (
-                f"Request [{result.approval.reference}]({request_link}) is now waiting in ServiceNow "
-                "for a human to approve."
-            )
+            approval_line = f"Request [{result.approval.reference}]({request_link})"
         record["caption"] = (
-            f"{approval_line} Nothing is applied to any cloud until that happens — use "
-            "\"Check approval status\" below once it's been actioned."
+            f"{approval_line} is waiting in ServiceNow for a human to approve, and "
+            f"[PR #{result.pull_request.number}]({result.pull_request.html_url}) is open on GitHub with the "
+            "proposed Terraform change. Nothing is applied to any cloud until a human approves AND merges — "
+            "use \"Refresh pipeline status\" below to follow along."
         )
         record["result"] = result
 
@@ -332,12 +336,52 @@ def compute_assistant_record(prompt: str, requester: str, cloud: Cloud, catalog:
 
 
 APPROVAL_STATE_LABELS = {
-    "requested": "🟡 Still pending in ServiceNow",
-    "approved": "✅ Approved in ServiceNow — would now be applied by CI/CD",
-    "rejected": "❌ Rejected in ServiceNow",
+    "requested": "🟡 Pending",
+    "approved": "✅ Approved",
+    "rejected": "❌ Rejected",
     "cancelled": "⚪ Cancelled",
     "not requested": "⚪ Not yet requested",
 }
+
+PR_STATE_LABELS = {
+    "open": "🟡 Open — not merged yet",
+    "merged": "✅ Merged",
+    "closed": "❌ Closed without merging",
+}
+
+BUILD_STATUS_LABELS = {
+    "queued": "🟡 Queued",
+    "in_progress": "🟡 Running",
+    "success": "✅ Applied successfully",
+    "failure": "❌ Failed",
+    "timed_out": "❌ Timed out",
+    "cancelled": "❌ Cancelled",
+}
+
+
+def render_pipeline_steps(message: dict) -> None:
+    result = message["result"]
+    approval_state = message.get("last_checked_approval")
+    pr_state = message.get("last_checked_pr")
+    build = message.get("last_checked_build")
+
+    lines = ["**Pipeline status:**", "1. ✅ Policy check — passed"]
+
+    approval_label = APPROVAL_STATE_LABELS.get(approval_state, "⚪ Not checked yet") if approval_state else "⚪ Not checked yet"
+    lines.append(f"2. {approval_label} — ServiceNow request `{result.approval.reference}`")
+
+    pr_label = PR_STATE_LABELS.get(pr_state, "⚪ Not checked yet") if pr_state else "⚪ Not checked yet"
+    lines.append(f"3. {pr_label} — [PR #{result.pull_request.number}]({result.pull_request.html_url})")
+
+    if pr_state != "merged":
+        lines.append("4. ⚪ Waiting on PR merge before the pipeline can apply")
+    elif build is None:
+        lines.append("4. 🟡 Merged — GitHub Actions run not found yet (may take a few seconds to start)")
+    else:
+        build_label = BUILD_STATUS_LABELS.get(build.status, build.status)
+        lines.append(f"4. {build_label} — [GitHub Actions run]({build.log_url})")
+
+    st.markdown("\n".join(lines))
 
 
 def render_turn(message: dict, index: int) -> None:
@@ -364,13 +408,13 @@ def render_turn(message: dict, index: int) -> None:
 
         if message["result"]:
             render_technical_details(message["result"])
+            render_pipeline_steps(message)
 
-            if message.get("last_checked_state"):
-                label = APPROVAL_STATE_LABELS.get(message["last_checked_state"], message["last_checked_state"])
-                st.markdown(f"**Last checked status:** {label}")
-
-            if st.button("🔄 Check approval status", key=f"check_status_{index}"):
-                message["last_checked_state"] = check_approval_status(message["result"].approval)
+            if st.button("🔄 Refresh pipeline status", key=f"check_status_{index}"):
+                message["last_checked_approval"] = check_approval_status(message["result"].approval)
+                pr_state, build = check_pipeline_status(message["result"].pull_request)
+                message["last_checked_pr"] = pr_state
+                message["last_checked_build"] = build
                 st.rerun()
 
         if message["technical_error"]:
