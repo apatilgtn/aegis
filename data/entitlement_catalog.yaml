@@ -1,0 +1,55 @@
+# Entitlement catalog — the source of truth for capability -> real entitlement
+# resolution. Every row here is a deliberate, human-reviewed mapping. The agent
+# may only select a row by exact key match; it never derives resource_id itself.
+#
+# Adding a business unit / tier / environment combination means adding a row
+# here (and getting it reviewed), not extending prompt logic.
+
+entries:
+  - id: azure-payments-nonprod-tier2
+    cloud: azure
+    business_unit: payments
+    environment: nonprod
+    tier: tier2
+    resource_type: entra_group
+    resource_id: "00000000-0000-0000-0000-000000000101"  # Entra group object ID
+    display_name: "Payments Non-Prod — Tier 2 Access"
+    max_ttl_hours: 24
+    terraform_module: "modules/azure/entra_group_membership"
+
+  - id: gcp-payments-nonprod-tier2
+    cloud: gcp
+    business_unit: payments
+    environment: nonprod
+    tier: tier2
+    resource_type: iam_binding
+    resource_id: "roles/payments.nonprod.tier2Access"
+    display_name: "Payments Non-Prod — Tier 2 Access"
+    max_ttl_hours: 24
+    terraform_module: "modules/gcp/iam_binding"
+
+  - id: azure-payments-nonprod-tier1
+    cloud: azure
+    business_unit: payments
+    environment: nonprod
+    tier: tier1
+    resource_type: entra_group
+    resource_id: "00000000-0000-0000-0000-000000000102"
+    display_name: "Payments Non-Prod — Tier 1 Access (read-only)"
+    max_ttl_hours: 72
+    terraform_module: "modules/azure/entra_group_membership"
+
+  - id: gcp-payments-nonprod-tier1
+    cloud: gcp
+    business_unit: payments
+    environment: nonprod
+    tier: tier1
+    resource_type: iam_binding
+    resource_id: "roles/payments.nonprod.tier1ReadOnly"
+    display_name: "Payments Non-Prod — Tier 1 Access (read-only)"
+    max_ttl_hours: 72
+    terraform_module: "modules/gcp/iam_binding"
+
+# Deliberately no *-prod-* rows for tier2/tier3 yet: production access grants
+# are out of scope for the MVP demo and must be added as their own reviewed
+# change, not inferred by widening the tier/environment match.
