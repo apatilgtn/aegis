@@ -89,10 +89,16 @@ class AccessGrantRequest(BaseModel):
 class AccessGrantResult(BaseModel):
     capability: Literal["access_grant"] = "access_grant"
     entitlement: EntitlementRef
-    iac_diff: str = Field(description="Terraform HCL diff opened as a PR")
+    iac_diff: str = Field(description="Terraform HCL diff — not opened as a PR until approved")
+    branch_name: str = Field(description="Branch the PR will be opened on, once approved")
+    file_path: str = Field(description="Repo path the diff will be committed to, once approved")
+    pr_title: str
+    pr_body: str
     policy_decision: PolicyDecision
     approval: ApprovalRef
-    pull_request: PullRequestRef
+    pull_request: PullRequestRef | None = Field(
+        default=None, description="Set only after ServiceNow approval — never exists before then"
+    )
     expires_at: datetime
 
 

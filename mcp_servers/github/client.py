@@ -105,6 +105,15 @@ def get_pull_request_state(pr_number: int) -> str:
     return pr["state"]
 
 
+def merge_pull_request(pr_number: int) -> str:
+    """The one write action a human explicitly triggers — via an in-chat
+    confirmation after ServiceNow approval, per user decision. Returns the
+    merge commit SHA."""
+    repo, token = _config()
+    result = _request("PUT", f"/repos/{repo}/pulls/{pr_number}/merge", token, json={"merge_method": "squash"})
+    return result["sha"]
+
+
 def get_merge_commit_sha(pr_number: int) -> str | None:
     """Returns the merge commit SHA once merged, else None — used to look up
     the GitHub Actions run that resulted from this specific PR."""
