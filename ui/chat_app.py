@@ -52,43 +52,53 @@ CATALOG_PATH = Path(__file__).resolve().parents[1] / "data" / "entitlement_catal
 
 ENV_LABELS = {Environment.NONPROD: "Non-Prod", Environment.PROD: "Production"}
 
-NEOBRUTALISM_CSS = """
+CARD_UI_CSS = """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
 :root {
-    --nb-border: #111111;
-    --nb-yellow: #FFDE59;
-    --nb-bg: #FFFBF0;
-    --nb-card: #FFFFFF;
-    --nb-text: #111111;
-    --nb-shadow: 5px 5px 0 var(--nb-border);
+    --border: #1A1A1A;
+    --bg: #EDEDED;
+    --card: #F7F5F0;
+    --text: #111111;
+    --text-secondary: #6B6B6B;
+    --yellow: #F0C64A;
+    --pink: #F6D3E4;
+    --lavender: #DAD6F5;
+    --mint: #B7F0C4;
+    --mint-text: #1E8E3E;
+    --radius-lg: 18px;
+    --radius-sm: 10px;
+    --shadow-soft: 0 1px 3px rgba(0, 0, 0, 0.06);
 }
 
-/* Force a flat, opaque background + black text everywhere first, so no
-   element can inherit a half-applied dark-theme background behind text. */
 html, body, .stApp, [class*="css"] {
-    background-color: var(--nb-bg) !important;
-    color: var(--nb-text) !important;
-    font-family: 'Helvetica Neue', Arial, sans-serif;
+    background-color: var(--bg) !important;
+    color: var(--text) !important;
+    font-family: 'Inter', 'Helvetica Neue', Arial, sans-serif;
 }
-/* Scoped to text content only — NOT a blanket div/span rule, since that
-   also strips background-color from widget internals like the radio
-   button's selected-state dot. */
+/* Subtle grain texture on the page background, approximated without an
+   image asset via a fine repeating dot pattern. */
+.stApp {
+    background-image: radial-gradient(rgba(0, 0, 0, 0.035) 1px, transparent 1px);
+    background-size: 3px 3px;
+}
+
 .stMarkdown, .stMarkdown p, .stMarkdown span, .stMarkdown li,
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] *,
 h1, h2, h3, h4, h5, h6 {
     background-color: transparent !important;
-    color: var(--nb-text) !important;
+    color: var(--text) !important;
 }
 
-/* Hide Streamlit's dev toolbar for a cleaner look */
 header[data-testid="stHeader"] {
     background-color: transparent !important;
     box-shadow: none !important;
 }
 
 h1, h2, h3 {
-    font-weight: 900 !important;
-    letter-spacing: 0.3px;
+    font-weight: 800 !important;
+    letter-spacing: -0.01em;
 }
 
 .aegis-logo {
@@ -97,94 +107,119 @@ h1, h2, h3 {
     gap: 10px;
 }
 .aegis-logo .badge {
-    background-color: var(--nb-yellow);
-    border: 3px solid var(--nb-border);
-    box-shadow: var(--nb-shadow);
+    background-color: var(--yellow);
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-soft);
     padding: 4px 10px;
-    font-size: 1.6rem;
+    font-size: 1.5rem;
 }
 
-/* Sidebar: cream, not a solid color block — border is the accent */
+/* Sidebar: a bordered rules panel, matching the card language */
 section[data-testid="stSidebar"] {
-    background-color: var(--nb-card) !important;
-    border-right: 3px solid var(--nb-border);
+    background-color: var(--card) !important;
+    border-right: 1.5px solid var(--border);
 }
 section[data-testid="stSidebar"] h3 {
-    border-bottom: 4px solid var(--nb-yellow);
+    border-bottom: 3px solid var(--yellow);
     display: inline-block;
     padding-bottom: 2px;
+    font-weight: 700 !important;
 }
 
-/* Buttons: black fill, white text — the one inverted element for contrast */
+/* Buttons: black-fill pill, the reference's primary CTA style */
 .stButton>button {
-    border: 2.5px solid var(--nb-border) !important;
-    border-radius: 0 !important;
-    background-color: var(--nb-border) !important;
+    border: 1.5px solid var(--border) !important;
+    border-radius: 999px !important;
+    background-color: var(--border) !important;
     color: #ffffff !important;
-    font-weight: 700 !important;
-    box-shadow: var(--nb-shadow) !important;
-    transition: transform 0.05s ease, box-shadow 0.05s ease;
+    font-weight: 600 !important;
+    box-shadow: none !important;
+    transition: opacity 0.1s ease, transform 0.05s ease;
+}
+.stButton>button:hover {
+    opacity: 0.85;
 }
 .stButton>button:active {
-    transform: translate(4px, 4px);
-    box-shadow: 1px 1px 0 var(--nb-border) !important;
+    transform: scale(0.98);
 }
 
-/* Chat messages — flat white cards, black text, hard shadow */
+/* Chat messages: clean rounded cards, thin border, soft shadow */
 [data-testid="stChatMessage"] {
-    background-color: var(--nb-card) !important;
-    border: 2.5px solid var(--nb-border) !important;
-    border-radius: 0 !important;
-    box-shadow: var(--nb-shadow) !important;
-    margin-bottom: 16px !important;
-    padding: 6px !important;
+    background-color: var(--card) !important;
+    border: 1.5px solid var(--border) !important;
+    border-radius: var(--radius-lg) !important;
+    box-shadow: var(--shadow-soft) !important;
+    margin-bottom: 14px !important;
+    padding: 10px !important;
 }
 [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
-    background-color: #FFF3D6 !important;
+    background-color: #FFFFFF !important;
 }
 
-/* Chat input */
 [data-testid="stChatInput"] {
-    border: 2.5px solid var(--nb-border) !important;
-    border-radius: 0 !important;
-    box-shadow: var(--nb-shadow) !important;
-    background-color: var(--nb-card) !important;
+    border: 1.5px solid var(--border) !important;
+    border-radius: var(--radius-lg) !important;
+    box-shadow: var(--shadow-soft) !important;
+    background-color: var(--card) !important;
 }
 [data-testid="stChatInput"] textarea {
-    background-color: var(--nb-card) !important;
-    color: var(--nb-text) !important;
+    background-color: var(--card) !important;
+    color: var(--text) !important;
 }
 
-/* Alerts (st.error / st.warning / st.info / st.success) keep their tint
-   but gain the same border/shadow language */
 div[data-testid="stAlert"] {
-    border: 2.5px solid var(--nb-border) !important;
-    border-radius: 0 !important;
-    box-shadow: var(--nb-shadow) !important;
+    border: 1.5px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    box-shadow: var(--shadow-soft) !important;
 }
 div[data-testid="stAlert"] p {
-    color: var(--nb-text) !important;
+    color: var(--text) !important;
 }
 
-/* Expander */
 details {
-    border: 2.5px solid var(--nb-border) !important;
-    border-radius: 0 !important;
-    box-shadow: var(--nb-shadow) !important;
-    background-color: var(--nb-card) !important;
+    border: 1.5px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
+    box-shadow: var(--shadow-soft) !important;
+    background-color: #FFFFFF !important;
 }
 
-/* Code blocks */
 pre, code {
-    border: 2.5px solid var(--nb-border) !important;
-    border-radius: 0 !important;
+    border: 1.5px solid var(--border) !important;
+    border-radius: var(--radius-sm) !important;
     background-color: #F5F5F5 !important;
-    color: var(--nb-text) !important;
+    color: var(--text) !important;
 }
 
 [data-testid="stCaptionContainer"] {
-    font-weight: 500;
-    opacity: 0.75;
+    font-weight: 400;
+    color: var(--text-secondary) !important;
+}
+
+/* Stat chips: the row of colored boxes from the reference design */
+.stat-chip-row {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin: 8px 0 12px;
+}
+.stat-chip {
+    border: 1.5px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px 14px;
+    min-width: 110px;
+}
+.stat-chip-label {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.65;
+    margin-bottom: 2px;
+}
+.stat-chip-value {
+    font-size: 1.05rem;
+    font-weight: 700;
 }
 </style>
 """
@@ -198,10 +233,12 @@ APPROVAL_STATE_LABELS = {
 }
 
 PR_STATE_LABELS = {
-    "open": "🟡 Open — not merged yet",
+    "open": "🟡 Open, not merged yet",
     "merged": "✅ Merged",
     "closed": "❌ Closed without merging",
 }
+
+CHIP_COLORS = ["#F0C64A", "#F6D3E4", "#DAD6F5", "#B7F0C4"]
 
 BUILD_STATUS_LABELS = {
     "queued": "🟡 Queued",
@@ -238,6 +275,19 @@ def servicenow_link_or_bold(reference: str, request_sys_id: str) -> str:
     return external_link(url, reference) if url else f"<strong>{reference}</strong>"
 
 
+def render_stat_chips(pairs: list[tuple[str, str]]) -> None:
+    """Renders the colored stat-chip row. Only ever called with system
+    values (cloud names, tiers, durations) — never raw user-typed text —
+    so this is safe to render as HTML."""
+    chips = "".join(
+        f'<div class="stat-chip" style="background-color:{CHIP_COLORS[i % len(CHIP_COLORS)]};">'
+        f'<div class="stat-chip-label">{label}</div>'
+        f'<div class="stat-chip-value">{value}</div></div>'
+        for i, (label, value) in enumerate(pairs)
+    )
+    st.markdown(f'<div class="stat-chip-row">{chips}</div>', unsafe_allow_html=True)
+
+
 # ---- conversation state helpers --------------------------------------------------
 
 def init_state() -> None:
@@ -248,14 +298,18 @@ def init_state() -> None:
     st.session_state.messages = [
         text_turn(
             "assistant",
-            "Hi, I'm **Aegis** ⚡ — I can check your current cloud access or help you request new "
-            "access. Nothing is ever applied without human approval.\n\nFirst: which cloud — Azure or GCP?",
+            "Hi, I'm **Aegis** ⚡. I can check your current cloud access or help you request new "
+            "access. Nothing is ever applied without human approval.\n\nFirst: which cloud, Azure or GCP?",
         )
     ]
 
 
 def text_turn(role: str, content: str) -> dict:
     return {"kind": "text", "role": role, "content": content}
+
+
+def summary_turn(draft: dict) -> dict:
+    return {"kind": "summary", "role": "assistant", "draft": dict(draft)}
 
 
 def result_turn(content: str, result) -> dict:
@@ -283,7 +337,7 @@ def reset_conversation() -> None:
     st.session_state.conv_step = "ask_cloud"
     st.session_state.draft = {}
     st.session_state.messages = [
-        text_turn("assistant", "Let's start over — which cloud, Azure or GCP?")
+        text_turn("assistant", "Let's start over. Which cloud, Azure or GCP?")
     ]
 
 
@@ -293,14 +347,14 @@ def handle_cloud_choice(cloud: Cloud) -> None:
     user_says(cloud.value.upper())
     st.session_state.draft["cloud"] = cloud
     st.session_state.conv_step = "ask_env"
-    bot_says("Which environment — Non-Prod or Production?")
+    bot_says("Which environment: Non-Prod or Production?")
 
 
 def handle_env_choice(environment: Environment) -> None:
     user_says(ENV_LABELS[environment])
     if environment == Environment.PROD:
         bot_says(
-            "Production access isn't offered through this self-service flow — only Non-Prod is "
+            "Production access isn't offered through this self-service flow. Only Non-Prod is "
             "available today. Continuing with Non-Prod."
         )
         st.session_state.draft["environment"] = Environment.NONPROD
@@ -313,7 +367,7 @@ def handle_env_choice(environment: Environment) -> None:
 def handle_email_input(email: str, catalog: EntitlementCatalog) -> None:
     user_says(email)
     if "@" not in email:
-        bot_says("That doesn't look like a valid email — could you try again?")
+        bot_says("That doesn't look like a valid email. Could you try again?")
         return
 
     st.session_state.draft["email"] = email
@@ -337,7 +391,7 @@ def handle_email_input(email: str, catalog: EntitlementCatalog) -> None:
             )
             st.session_state.conv_step = "ask_role"
         else:
-            bot_says("There's nothing available to request for this combination yet — contact the platform team.")
+            bot_says("There's nothing available to request for this combination yet. Contact the platform team.")
             st.session_state.conv_step = "idle_done"
 
 
@@ -348,7 +402,7 @@ def handle_existing_followup(wants_more: bool) -> None:
         st.session_state.conv_step = "ask_role"
     else:
         user_says("That's all, thanks")
-        bot_says("Sounds good — I'm here if you need anything else. Use \"Start over\" in the sidebar anytime.")
+        bot_says("Sounds good. I'm here if you need anything else. Use \"Start over\" in the sidebar anytime.")
         st.session_state.conv_step = "idle_done"
 
 
@@ -373,7 +427,7 @@ def handle_role_choice(entry: EntitlementCatalogEntry) -> None:
 def handle_duration_input(text: str) -> None:
     match = re.search(r"(\d+)", text)
     if not match:
-        bot_says("I couldn't find a number of hours in that — how many hours do you need?")
+        bot_says("I couldn't find a number of hours in that. How many hours do you need?")
         return
 
     user_says(text)
@@ -389,24 +443,14 @@ def handle_justification_input(text: str, catalog: EntitlementCatalog) -> None:
         return
 
     st.session_state.draft["justification"] = text.strip()
-    d = st.session_state.draft
-    summary = (
-        "**Here's what I'll submit:**\n"
-        f"- Cloud: **{d['cloud'].value.upper()}**\n"
-        f"- Business unit: **{d['business_unit'].title()}**\n"
-        f"- Access level: **{human_tier(d['tier'])}**\n"
-        f"- Duration: **{d['ttl_hours']} hours**\n"
-        f"- Justification: _{d['justification']}_\n\n"
-        "Shall I submit this request?"
-    )
     st.session_state.conv_step = "confirm"
-    bot_says(summary)
+    st.session_state.messages.append(summary_turn(st.session_state.draft))
 
 
 def handle_confirm(yes: bool, catalog: EntitlementCatalog) -> None:
     if not yes:
         user_says("No, cancel")
-        bot_says("No problem — cancelled. Want to start a new request? Which cloud — Azure or GCP?")
+        bot_says("No problem, cancelled. Want to start a new request? Which cloud, Azure or GCP?")
         st.session_state.draft = {}
         st.session_state.conv_step = "ask_cloud"
         return
@@ -441,11 +485,11 @@ def handle_confirm(yes: bool, catalog: EntitlementCatalog) -> None:
     approval_ref = servicenow_link_or_bold(result.approval.reference, result.approval.request_sys_id)
 
     content = (
-        f"**🟡 Passed policy checks — sent for human approval.** Nothing has been granted yet.\n\n"
+        f"**🟡 Passed policy checks. Sent for human approval.** Nothing has been granted yet.\n\n"
         f"Request {approval_ref} is now waiting in ServiceNow (opens in a new tab). **No pull "
-        "request has been opened yet** — one will only be raised once a human approves this in "
+        "request has been opened yet.** One will only be raised once a human approves this in "
         "ServiceNow, so a declined request never leaves a proposed change sitting on GitHub.\n\n"
-        "Use \"Refresh pipeline status\" below to check — I'll open the PR automatically the moment "
+        "Use \"Refresh pipeline status\" below to check. I'll open the PR automatically the moment "
         "it's approved, and offer to merge it for you."
     )
     st.session_state.messages.append(result_turn(content, result))
@@ -461,7 +505,7 @@ def render_technical_details(result) -> None:
             f"- Pull request: {external_link(result.pull_request.html_url, f'#{result.pull_request.number}')} "
             f"(branch `{result.pull_request.branch}`)\n"
             if result.pull_request
-            else f"- Pull request: not yet raised — will open on branch `{result.branch_name}` once approved\n"
+            else f"- Pull request: not yet raised. Will open on branch `{result.branch_name}` once approved\n"
         )
         st.markdown(
             f"- Policy check: `{', '.join(result.policy_decision.policy_ids)}`\n"
@@ -484,37 +528,37 @@ def render_pipeline_steps(message: dict) -> None:
     build = message.get("last_checked_build")
     sn_ref = servicenow_link_or_bold(result.approval.reference, result.approval.request_sys_id)
 
-    lines = ["**Pipeline status:**", "1. ✅ Policy check — passed"]
+    lines = ["**Pipeline status:**", "1. ✅ Policy check: passed"]
 
     if message.get("rejected"):
         rejected_label = APPROVAL_STATE_LABELS.get(approval_state, f"❌ {approval_state}")
-        lines.append(f"2. {rejected_label} — ServiceNow request {sn_ref}")
-        lines.append("3. ⚪ No pull request was raised — a declined request never reaches GitHub")
+        lines.append(f"2. {rejected_label}: ServiceNow request {sn_ref}")
+        lines.append("3. ⚪ No pull request was raised. A declined request never reaches GitHub")
         lines.append("4. ⚪ Nothing to apply")
         st.markdown("\n".join(lines), unsafe_allow_html=True)
         return
 
     approval_label = APPROVAL_STATE_LABELS.get(approval_state, "⚪ Not checked yet") if approval_state else "⚪ Not checked yet"
-    lines.append(f"2. {approval_label} — ServiceNow request {sn_ref}")
+    lines.append(f"2. {approval_label}: ServiceNow request {sn_ref}")
 
     if result.pull_request is None:
-        lines.append("3. ⚪ Not raised yet — opens automatically once approved")
+        lines.append("3. ⚪ Not raised yet. Opens automatically once approved")
         lines.append("4. ⚪ Waiting on approval, then PR merge, before the pipeline can apply")
         st.markdown("\n".join(lines), unsafe_allow_html=True)
         return
 
     pr_link = external_link(result.pull_request.html_url, f"PR #{result.pull_request.number}")
     pr_label = PR_STATE_LABELS.get(pr_state, "⚪ Not checked yet") if pr_state else "⚪ Not checked yet"
-    lines.append(f"3. {pr_label} — {pr_link}")
+    lines.append(f"3. {pr_label}: {pr_link}")
 
     if pr_state != "merged":
         lines.append("4. ⚪ Waiting on PR merge before the pipeline can apply")
     elif build is None:
-        lines.append("4. 🟡 Merged — GitHub Actions run not found yet (may take a few seconds to start)")
+        lines.append("4. 🟡 Merged. GitHub Actions run not found yet (may take a few seconds to start)")
     else:
         build_label = BUILD_STATUS_LABELS.get(build.status, build.status)
         build_link = external_link(build.log_url, "GitHub Actions run")
-        lines.append(f"4. {build_label} — {build_link}")
+        lines.append(f"4. {build_label}: {build_link}")
 
     st.markdown("\n".join(lines), unsafe_allow_html=True)
 
@@ -534,7 +578,7 @@ def render_result_turn(message: dict, index: int) -> None:
 
     cols = st.columns(2)
     if cols[0].button("🔄 Refresh pipeline status", key=f"refresh_{index}"):
-        with st.spinner("Checking ServiceNow — opening the PR now if it's just been approved..."):
+        with st.spinner("Checking ServiceNow. Opening the PR now if it's just been approved..."):
             try:
                 result = advance_pipeline(result)
             except ApprovalRejected as exc:
@@ -567,10 +611,29 @@ def render_result_turn(message: dict, index: int) -> None:
         st.rerun()
 
 
+def render_summary_turn(message: dict) -> None:
+    d = message["draft"]
+    st.markdown("**Here's what I'll submit:**")
+    render_stat_chips(
+        [
+            ("Cloud", d["cloud"].value.upper()),
+            ("Business unit", d["business_unit"].title()),
+            ("Access level", human_tier(d["tier"])),
+            ("Duration", f"{d['ttl_hours']}h"),
+        ]
+    )
+    # Plain markdown, no unsafe_allow_html: justification is raw user-typed
+    # text and must never be interpreted as HTML.
+    st.markdown(f"**Reason:** {d['justification']}")
+    st.markdown("Shall I submit this request?")
+
+
 def render_turn(message: dict, index: int) -> None:
     with st.chat_message(message["role"]):
         if message["kind"] == "result":
             render_result_turn(message, index)
+        elif message["kind"] == "summary":
+            render_summary_turn(message)
         else:
             st.markdown(message["content"])
 
@@ -650,8 +713,8 @@ def render_step_controls(catalog: EntitlementCatalog) -> str | None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="AEGIS — Agentic Cloud Governance", layout="centered")
-    st.markdown(NEOBRUTALISM_CSS, unsafe_allow_html=True)
+    st.set_page_config(page_title="AEGIS: Agentic Cloud Governance", layout="centered")
+    st.markdown(CARD_UI_CSS, unsafe_allow_html=True)
 
     catalog = load_catalog()
     init_state()
@@ -662,14 +725,14 @@ def main() -> None:
         unsafe_allow_html=True,
     )
     st.caption(
-        "A conversation, not a form — tell me what you need and I'll check policy, raise the "
+        "A conversation, not a form. Tell me what you need and I'll check policy, raise the "
         "approval, and follow the change through to apply. Nothing happens without a human saying yes."
     )
 
     with st.sidebar:
-        st.subheader("About")
+        st.subheader("Market Rules")
         st.caption(
-            "Everything Aegis needs — cloud, environment, identity, role, duration, justification — "
+            "Everything Aegis needs (cloud, environment, identity, role, duration, justification) "
             "is gathered right here in the chat. Access is only ever applied after ServiceNow approval "
             "and a merged pull request."
         )
