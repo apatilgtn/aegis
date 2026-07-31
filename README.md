@@ -64,7 +64,6 @@ The chat only ever writes to ServiceNow and GitHub (proposals and approvals); it
 | CI/CD pipeline | **Real**, on GitHub Actions (not Cloud Build — deliberately switched so the same workflow shape extends to Azure or any other cloud as another job) |
 | Azure identity/group membership | **Mocked.** No Azure tenant credentials exist in this environment; `mcp_servers/azure_entra/directory_service.py` is an in-memory stand-in with the same function signatures a real Graph API client would have |
 | Natural-language understanding | **Not an LLM call.** The original design envisions an LLM-driven orchestrator; what's built is a deterministic guided conversation (buttons + short free-text fields) that produces the same `AccessGrantRequest` contract. Swapping in a real LLM means replacing the conversation's input-gathering step, not redesigning anything downstream |
-| `ui/intent_parser.py` | **Dead code.** An earlier free-text regex parser, superseded by the guided conversation and no longer imported anywhere. Kept for reference; safe to delete |
 | Other capabilities (cost/FinOps, tagging, incident triage) | **Not built.** Only `access_grant` (and its read-only sibling `access_check`) exist |
 
 ## Repository layout
@@ -113,7 +112,7 @@ Secrets live in `.env` (gitignored) and, for GCP, a service account key under `.
 python3 -m pytest -q
 ```
 
-34 tests across contracts, the entitlement catalog, the guardrail policy (evaluated for real against the actual `.rego` file via `regopy`, not mocked), and both capability agents. External calls (ServiceNow, GitHub) are stubbed in the automated suite so running tests never creates real tickets or PRs — the real integrations are verified separately via live scripted runs, several of which resulted in genuine, confirmed GCP IAM grants.
+29 tests across contracts, the entitlement catalog, the guardrail policy (evaluated for real against the actual `.rego` file via `regopy`, not mocked), and both capability agents. External calls (ServiceNow, GitHub) are stubbed in the automated suite so running tests never creates real tickets or PRs — the real integrations are verified separately via live scripted runs, several of which resulted in genuine, confirmed GCP IAM grants.
 
 ## Security notes
 
