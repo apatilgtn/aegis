@@ -14,6 +14,7 @@ does not correct wrong values, which is out of scope for this MVP.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from agents.guardrail_agent import evaluate_tag_remediation
@@ -75,12 +76,23 @@ class ApprovalRejected(Exception):
         super().__init__(f"the request was not approved (ServiceNow state: {state!r}) — no pull request was raised")
 
 
+def _gcp_label_safe(value: str) -> str:
+    """GCP labels only permit lowercase letters, digits, hyphens, and
+    underscores (max 63 chars) — sanitizes a free-text value (e.g. an email
+    or a typed cost-center code) into a valid label value deterministically,
+    rather than letting `terraform apply` fail on it later in CI."""
+    return re.sub(r"[^a-z0-9_-]", "-", value.lower())[:63]
+
+
 def _default_values(request: TagComplianceRequest) -> dict[str, str]:
-    return {
+    values = {
         "owner": request.requester,
         "cost-center": request.cost_center,
         "environment": request.environment.value,
     }
+    if request.cloud == Cloud.GCP:
+        values = {key: _gcp_label_safe(value) for key, value in values.items()}
+    return values
 
 
 def check_tag_compliance(cloud: Cloud, resource_id: str) -> tuple[dict[str, str], list[str]]:

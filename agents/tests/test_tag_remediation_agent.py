@@ -5,6 +5,7 @@ from agents.tag_remediation_agent import (
     ApprovalRejected,
     MergeNotAllowed,
     TagRemediationDenied,
+    _gcp_label_safe,
     advance_pipeline,
     check_approval_status,
     check_pull_request_status,
@@ -77,6 +78,19 @@ def approve(monkeypatch):
     monkeypatch.setattr("agents.tag_remediation_agent.get_approval_state", lambda approval_sys_id: "approved")
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("jane.doe@example.com", "jane-doe-example-com"),
+        ("PMT-01", "pmt-01"),
+        ("nonprod", "nonprod"),
+        ("A" * 100, "a" * 63),
+    ],
+)
+def test_gcp_label_safe_sanitizes_to_a_valid_label(value, expected):
+    assert _gcp_label_safe(value) == expected
+
+
 def test_under_tagged_gcp_resource_produces_diff_with_no_pr_yet(under_tagged_gcp_request):
     result = handle_tag_remediation(under_tagged_gcp_request)
 
@@ -85,8 +99,11 @@ def test_under_tagged_gcp_resource_produces_diff_with_no_pr_yet(under_tagged_gcp
     assert set(result.missing_keys) == {"owner", "cost-center", "environment"}
     assert 'source      = "../../modules/gcp/tagged_bucket"' in result.iac_diff
     assert "aegis-demo-payments-bucket" in result.iac_diff
-    assert '"owner" = "jane.doe@example.com"' in result.iac_diff
-    assert '"cost-center" = "PMT-01"' in result.iac_diff
+    # GCP label values must be lowercase letters/digits/hyphens/underscores
+    # only — the agent sanitizes free-text values (email, cost-center) to
+    # fit, rather than letting `terraform apply` fail on them later.
+    assert '"owner" = "jane-doe-example-com"' in result.iac_diff
+    assert '"cost-center" = "pmt-01"' in result.iac_diff
     assert '"environment" = "nonprod"' in result.iac_diff
 
 
