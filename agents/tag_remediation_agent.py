@@ -1,34 +1,35 @@
 """
-The access_grant capability agent: resolves the entitlement, runs it past the
-guardrail, and — only if allowed — produces the IaC diff.
+The tag_remediation capability agent: checks a resource's current tags
+against the required-tags policy and — only if non-compliant and allowed by
+the guardrail — produces the IaC diff that fills in the missing keys.
 
-The pull request is deliberately NOT opened here. It's created only once
-ServiceNow approval is confirmed (see advance_pipeline) — a request that
-gets declined must never have had a PR proposing its change on GitHub in
-the first place.
+The pull request is deliberately NOT opened here, for the same reason as
+access_grant: a request that gets declined must never have had a PR
+proposing its change on GitHub in the first place (see advance_pipeline).
 
-`cloud` is passed in by the orchestrator, not inferred by this agent from the
-natural-language request: which cloud hosts a given business_unit/environment
-is routing knowledge the orchestrator owns, not something to guess here.
+Only missing required keys get a value filled in; any existing tag (required
+or not, correct or not) is preserved as-is — this capability closes gaps, it
+does not correct wrong values, which is out of scope for this MVP.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-from agents.guardrail_agent import evaluate_access_grant
-from agents.terraform_render import access_grant_slug, render_access_grant_diff
+from agents.guardrail_agent import evaluate_tag_remediation
+from agents.tag_render import render_tag_remediation_diff, tag_remediation_slug
 from contracts.capability_contract import (
-    AccessGrantRequest,
-    AccessGrantResult,
     ApprovalRef,
     Cloud,
     PolicyDecision,
     PullRequestRef,
+    TagComplianceRequest,
+    TagRef,
+    TagRemediationResult,
 )
-from contracts.entitlement_catalog import EntitlementCatalog
-from mcp_servers.azure_entra.directory_service import is_group_member, resolve_principal
-from mcp_servers.gcp_resource_manager.project_service import resolve_project
+from contracts.tag_policy import required_tag_keys
+from mcp_servers.azure_resource_tags.resource_tags import current_tags as read_azure_tags
+from mcp_servers.gcp_storage.bucket_labels import PROJECT_ID, current_labels as read_gcp_labels
 from mcp_servers.github.client import (
     GitHubConfigError,
     GitHubRequestError,
@@ -47,15 +48,15 @@ from mcp_servers.servicenow.client import (
 )
 
 
-class AccessGrantDenied(Exception):
+class TagRemediationDenied(Exception):
     def __init__(self, decision: PolicyDecision):
         self.decision = decision
         super().__init__("; ".join(decision.reasons) or "denied by guardrail policy")
 
 
-class AlreadyGrantedError(Exception):
-    def __init__(self, requester: str, catalog_entry_id: str):
-        super().__init__(f"{requester} already holds entitlement {catalog_entry_id!r} — no change to propose")
+class AlreadyCompliantError(Exception):
+    def __init__(self, resource_id: str):
+        super().__init__(f"{resource_id!r} already has every required tag — no change to propose")
 
 
 class ApprovalRequestFailed(Exception):
@@ -74,42 +75,51 @@ class ApprovalRejected(Exception):
         super().__init__(f"the request was not approved (ServiceNow state: {state!r}) — no pull request was raised")
 
 
-def handle_access_grant(
-    request: AccessGrantRequest,
-    cloud: Cloud,
-    catalog: EntitlementCatalog,
-) -> AccessGrantResult:
-    catalog_entry = catalog.resolve(request.business_unit, request.environment, request.tier, cloud)
+def _default_values(request: TagComplianceRequest) -> dict[str, str]:
+    return {
+        "owner": request.requester,
+        "cost-center": request.cost_center,
+        "environment": request.environment.value,
+    }
 
-    decision = evaluate_access_grant(request, catalog_entry)
+
+def check_tag_compliance(cloud: Cloud, resource_id: str) -> tuple[dict[str, str], list[str]]:
+    """Read-only preview of current tags and which required keys are
+    missing. Used both by the chat UI (to decide whether to keep asking
+    questions) and by handle_tag_remediation itself, so there's a single
+    source of truth for what "compliant" means."""
+    current = read_gcp_labels(resource_id) if cloud == Cloud.GCP else read_azure_tags(resource_id)
+    missing_keys = [key for key in required_tag_keys() if key not in current]
+    return current, missing_keys
+
+
+def handle_tag_remediation(request: TagComplianceRequest) -> TagRemediationResult:
+    decision = evaluate_tag_remediation(request)
     if not decision.allowed:
-        raise AccessGrantDenied(decision)
+        raise TagRemediationDenied(decision)
 
-    member_object_id = None
-    project_id = None
+    current, missing_keys = check_tag_compliance(request.cloud, request.resource_id)
+    if not missing_keys:
+        raise AlreadyCompliantError(request.resource_id)
 
-    if cloud == Cloud.AZURE:
-        # Reads live identity state via the MCP-fronted directory before
-        # proposing a change — never guesses the object ID from the UPN.
-        member_object_id = resolve_principal(request.requester)
-        if is_group_member(catalog_entry.resource_id, member_object_id):
-            raise AlreadyGrantedError(request.requester, catalog_entry.id)
-    elif cloud == Cloud.GCP:
-        project_id = resolve_project(request.business_unit)
+    defaults = _default_values(request)
+    proposed_values = dict(current)
+    for key in missing_keys:
+        proposed_values[key] = defaults[key]
+    proposed_tags = [TagRef(key=key, value=value) for key, value in sorted(proposed_values.items())]
 
-    iac_diff = render_access_grant_diff(
-        request, catalog_entry, member_object_id=member_object_id, project_id=project_id
-    )
+    project_id = PROJECT_ID if request.cloud == Cloud.GCP else None
+    iac_diff = render_tag_remediation_diff(request, proposed_tags, project_id=project_id)
 
-    slug = access_grant_slug(request, catalog_entry)
+    slug = tag_remediation_slug(request)
     unique_suffix = int(datetime.now(timezone.utc).timestamp())
-    branch_name = f"access-grant/{slug}-{unique_suffix}"
-    file_path = f"infra/access-grants/{slug}-{unique_suffix}.tf"
-    pr_title = f"Access grant: {catalog_entry.display_name} for {request.requester}"
+    branch_name = f"tag-remediation/{slug}-{unique_suffix}"
+    file_path = f"infra/tag-remediations/{slug}-{unique_suffix}.tf"
+    pr_title = f"Tag remediation: {request.resource_id}"
     pr_body = (
         f"**Requester:** {request.requester}\n"
         f"**Justification:** {request.justification}\n"
-        f"**Expires:** {request.ttl_hours}h after approval\n\n"
+        f"**Missing tags being added:** {', '.join(missing_keys)}\n\n"
         "Propose-don't-mutate: this PR only exists because ServiceNow already approved the "
         "request. It still takes effect only once a human merges it, which triggers the "
         "GitHub Actions pipeline to run `terraform apply`."
@@ -117,10 +127,11 @@ def handle_access_grant(
 
     try:
         access_request = create_access_request(
-            short_description=f"Aegis access grant — {catalog_entry.display_name} for {request.requester}",
+            short_description=f"Aegis tag remediation — {request.resource_id}",
             description=(
                 f"Requested by: {request.requester}\n"
-                f"Justification: {request.justification}\n\n"
+                f"Justification: {request.justification}\n"
+                f"Missing tags: {', '.join(missing_keys)}\n\n"
                 f"Proposed Terraform change (a pull request will be opened only once this is "
                 f"approved):\n{iac_diff}"
             ),
@@ -129,8 +140,12 @@ def handle_access_grant(
     except (ServiceNowConfigError, ServiceNowRequestError) as exc:
         raise ApprovalRequestFailed(str(exc)) from exc
 
-    return AccessGrantResult(
-        entitlement=catalog.to_entitlement_ref(catalog_entry),
+    return TagRemediationResult(
+        cloud=request.cloud,
+        resource_id=request.resource_id,
+        current_tags=[TagRef(key=k, value=v) for k, v in sorted(current.items())],
+        missing_keys=missing_keys,
+        proposed_tags=proposed_tags,
         iac_diff=iac_diff,
         branch_name=branch_name,
         file_path=file_path,
@@ -144,11 +159,10 @@ def handle_access_grant(
             state=access_request.approval_state,
         ),
         pull_request=None,
-        expires_at=datetime.now(timezone.utc) + timedelta(hours=request.ttl_hours),
     )
 
 
-def advance_pipeline(result: AccessGrantResult) -> AccessGrantResult:
+def advance_pipeline(result: TagRemediationResult) -> TagRemediationResult:
     """Polls ServiceNow and raises the PR the moment — and only the moment —
     approval is confirmed. Never raises a PR for anything pending or
     declined, and never re-raises one that already exists (safe to call on
@@ -207,7 +221,7 @@ class MergeNotAllowed(Exception):
         super().__init__(f"refusing to merge — ServiceNow approval state is {approval_state!r}, not 'approved'")
 
 
-def merge_access_grant(approval: ApprovalRef, pull_request: PullRequestRef) -> str:
+def merge_tag_remediation(approval: ApprovalRef, pull_request: PullRequestRef) -> str:
     """The one explicit human-triggered write in this whole flow: merging the
     PR, which is what actually lets the CI/CD pipeline apply the change.
     Re-checks the live approval state itself rather than trusting a stale

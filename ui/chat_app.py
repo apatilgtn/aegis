@@ -8,15 +8,21 @@ checks the requester's *current* access before asking what they want, so an
 existing holder is told what they already have instead of being walked
 through a request they don't need.
 
-State machine (st.session_state.conv_step):
-  ask_cloud -> ask_env -> ask_email -> [check current access]
-    -> existing_access_found -> (loop back to ask_role) | idle_done
-    -> ask_role -> ask_duration -> ask_justification -> confirm -> done
+ask_intent branches into one of three state machines (st.session_state.conv_step):
 
-"done" is not a dead end: the submitted request's chat turn carries its own
-"Refresh pipeline status" and (once approved) "Merge now" actions, so the
-whole propose -> approve -> merge -> apply loop is followable from the chat
-without leaving it — merging is still a deliberate human click, just one
+  access_grant:      ask_cloud -> ask_env -> ask_email -> [check current access]
+                        -> existing_access_found -> (loop back to ask_role) | idle_done
+                        -> ask_role -> ask_duration -> ask_justification -> confirm -> done
+  incident_triage:   ask_incident_cloud -> ask_incident_email -> ask_resource_hint
+                        -> ask_incident_window -> ask_incident_justification -> idle_done
+  tag_remediation:   ask_tag_cloud -> ask_tag_env -> ask_tag_email -> ask_tag_resource
+                        -> [check compliance] -> idle_done (already compliant) | ask_tag_cost_center
+                        -> ask_tag_justification -> tag_confirm -> tag_done
+
+"done"/"tag_done" are not dead ends: the submitted request's chat turn carries
+its own "Refresh pipeline status" and (once approved) "Merge now" actions, so
+the whole propose -> approve -> merge -> apply loop is followable from the
+chat without leaving it — merging is still a deliberate human click, just one
 that lives here instead of on GitHub.
 """
 
@@ -46,7 +52,27 @@ from agents.access_grant_agent import (
     merge_access_grant,
 )
 from agents.incident_triage_agent import IncidentRequestFailed, raise_incident, triage_incident
-from contracts.capability_contract import AccessGrantRequest, Cloud, Environment, IncidentTriageRequest, Tier
+from agents.tag_remediation_agent import (
+    AlreadyCompliantError,
+    ApprovalRejected as TagApprovalRejected,
+    ApprovalRequestFailed as TagApprovalRequestFailed,
+    MergeNotAllowed as TagMergeNotAllowed,
+    TagRemediationDenied,
+    advance_pipeline as tag_advance_pipeline,
+    check_approval_status as tag_check_approval_status,
+    check_pipeline_status as tag_check_pipeline_status,
+    check_tag_compliance,
+    handle_tag_remediation,
+    merge_tag_remediation,
+)
+from contracts.capability_contract import (
+    AccessGrantRequest,
+    Cloud,
+    Environment,
+    IncidentTriageRequest,
+    TagComplianceRequest,
+    Tier,
+)
 from contracts.entitlement_catalog import EntitlementCatalog, EntitlementCatalogEntry
 
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "data" / "entitlement_catalog.yaml"
@@ -310,7 +336,7 @@ def init_state() -> None:
         text_turn(
             "assistant",
             "Hi, I'm **Aegis** ⚡. Nothing is ever applied without human approval.\n\n"
-            "What would you like to do: request cloud access, or report an issue?",
+            "What would you like to do: request cloud access, report an issue, or check tagging/compliance?",
         )
     ]
 
@@ -347,6 +373,23 @@ def result_turn(content: str, result) -> dict:
     }
 
 
+def tag_summary_turn(draft: dict) -> dict:
+    return {"kind": "tag_summary", "role": "assistant", "draft": dict(draft)}
+
+
+def tag_result_turn(content: str, result) -> dict:
+    return {
+        "kind": "tag_result",
+        "role": "assistant",
+        "content": content,
+        "result": result,
+        "last_checked_approval": None,
+        "last_checked_pr": None,
+        "last_checked_build": None,
+        "rejected": False,
+    }
+
+
 def bot_says(text: str) -> None:
     st.session_state.messages.append(text_turn("assistant", text))
 
@@ -359,21 +402,29 @@ def reset_conversation() -> None:
     st.session_state.conv_step = "ask_intent"
     st.session_state.draft = {}
     st.session_state.messages = [
-        text_turn("assistant", "Let's start over. What would you like to do: request cloud access, or report an issue?")
+        text_turn(
+            "assistant",
+            "Let's start over. What would you like to do: request cloud access, report an issue, "
+            "or check tagging/compliance?",
+        )
     ]
 
 
 # ---- intent selection ----------------------------------------------------------------
 
-def handle_intent_choice(wants_access: bool) -> None:
-    if wants_access:
+def handle_intent_choice(intent: str) -> None:
+    if intent == "access":
         user_says("Request cloud access")
         st.session_state.conv_step = "ask_cloud"
         bot_says("Which cloud, Azure or GCP?")
-    else:
+    elif intent == "incident":
         user_says("Report an issue")
         st.session_state.conv_step = "ask_incident_cloud"
         bot_says("Which cloud is affected, Azure or GCP?")
+    else:
+        user_says("Check tagging / compliance")
+        st.session_state.conv_step = "ask_tag_cloud"
+        bot_says("Which cloud is the resource on, Azure or GCP?")
 
 
 # ---- step handlers: incident_triage ------------------------------------------------
@@ -434,6 +485,137 @@ def handle_incident_justification_input(text: str) -> None:
     result = triage_incident(request)
     st.session_state.messages.append(incident_result_turn(result, d["email"], text.strip()))
     st.session_state.conv_step = "idle_done"
+
+
+# ---- step handlers: tag_remediation ------------------------------------------------
+
+def handle_tag_cloud_choice(cloud: Cloud) -> None:
+    user_says(cloud.value.upper())
+    st.session_state.draft["cloud"] = cloud
+    st.session_state.conv_step = "ask_tag_env"
+    bot_says("Which environment: Non-Prod or Production?")
+
+
+def handle_tag_env_choice(environment: Environment) -> None:
+    user_says(ENV_LABELS[environment])
+    if environment == Environment.PROD:
+        bot_says(
+            "Production resources aren't remediated through this self-service flow. Only Non-Prod "
+            "is available today. Continuing with Non-Prod."
+        )
+        st.session_state.draft["environment"] = Environment.NONPROD
+    else:
+        st.session_state.draft["environment"] = environment
+    st.session_state.conv_step = "ask_tag_email"
+    bot_says("What's your email address?")
+
+
+def handle_tag_email_input(email: str) -> None:
+    user_says(email)
+    if "@" not in email:
+        bot_says("That doesn't look like a valid email. Could you try again?")
+        return
+    st.session_state.draft["email"] = email
+    if st.session_state.draft["cloud"] == Cloud.GCP:
+        bot_says(
+            "What's the name of the GCS bucket to check? If it doesn't exist yet, I'll propose "
+            "creating it with the right tags."
+        )
+    else:
+        bot_says("What's the name of the Azure resource group to check?")
+    st.session_state.conv_step = "ask_tag_resource"
+
+
+def handle_tag_resource_input(text: str) -> None:
+    if len(text.strip()) == 0:
+        bot_says("I need a resource name to check. What's the resource's name?")
+        return
+    user_says(text)
+    resource_id = text.strip()
+    st.session_state.draft["resource_id"] = resource_id
+
+    current, missing_keys = check_tag_compliance(st.session_state.draft["cloud"], resource_id)
+
+    if not missing_keys:
+        tags_desc = ", ".join(f"`{k}`" for k in sorted(current)) or "(none)"
+        bot_says(f"**`{resource_id}` already has every required tag** ({tags_desc}). Nothing to remediate.")
+        st.session_state.conv_step = "idle_done"
+        return
+
+    st.session_state.draft["current_tags"] = current
+    st.session_state.draft["missing_keys"] = missing_keys
+    tags_desc = ", ".join(f"`{k}`" for k in missing_keys)
+    bot_says(f"`{resource_id}` is missing: {tags_desc}. What's the cost-center code for this resource?")
+    st.session_state.conv_step = "ask_tag_cost_center"
+
+
+def handle_tag_cost_center_input(text: str) -> None:
+    user_says(text)
+    if len(text.strip()) < 2:
+        bot_says("Could you give a valid cost-center code (at least 2 characters)?")
+        return
+    st.session_state.draft["cost_center"] = text.strip()
+    st.session_state.conv_step = "ask_tag_justification"
+    bot_says("What's the justification for this remediation?")
+
+
+def handle_tag_justification_input(text: str) -> None:
+    user_says(text)
+    if len(text.strip()) < 10:
+        bot_says("Could you give a bit more detail (at least 10 characters)?")
+        return
+    st.session_state.draft["justification"] = text.strip()
+    st.session_state.conv_step = "tag_confirm"
+    st.session_state.messages.append(tag_summary_turn(st.session_state.draft))
+
+
+def handle_tag_confirm(yes: bool) -> None:
+    if not yes:
+        user_says("No, cancel")
+        bot_says("No problem, cancelled. Want to check another resource? Which cloud, Azure or GCP?")
+        st.session_state.draft = {}
+        st.session_state.conv_step = "ask_tag_cloud"
+        return
+
+    user_says("Yes, submit it")
+    d = st.session_state.draft
+    request = TagComplianceRequest(
+        requester=d["email"],
+        cloud=d["cloud"],
+        environment=d["environment"],
+        resource_id=d["resource_id"],
+        cost_center=d["cost_center"],
+        justification=d["justification"],
+    )
+
+    try:
+        result = handle_tag_remediation(request)
+    except TagRemediationDenied as exc:
+        bot_says("**❌ This can't be approved automatically:**\n\n" + "\n".join(f"- {r}" for r in exc.decision.reasons))
+        st.session_state.conv_step = "ask_tag_justification"
+        bot_says("Want to try again with a different justification?")
+        return
+    except AlreadyCompliantError:
+        bot_says("**ℹ️ This resource is already fully tagged.** Nothing more to do.")
+        st.session_state.conv_step = "idle_done"
+        return
+    except TagApprovalRequestFailed as exc:
+        bot_says(f"**Something went wrong raising this request.** {exc}\n\nPlease try again in a moment.")
+        st.session_state.conv_step = "tag_confirm"
+        return
+
+    approval_ref = servicenow_link_or_bold(result.approval.reference, result.approval.request_sys_id)
+
+    content = (
+        f"**🟡 Passed policy checks. Sent for human approval.** No tags have been applied yet.\n\n"
+        f"Request {approval_ref} is now waiting in ServiceNow (opens in a new tab). **No pull "
+        "request has been opened yet.** One will only be raised once a human approves this in "
+        "ServiceNow, so a declined request never leaves a proposed change sitting on GitHub.\n\n"
+        "Use \"Refresh pipeline status\" below to check. I'll open the PR automatically the moment "
+        "it's approved, and offer to merge it for you."
+    )
+    st.session_state.messages.append(tag_result_turn(content, result))
+    st.session_state.conv_step = "tag_done"
 
 
 # ---- step handlers: access_grant ---------------------------------------------------
@@ -723,6 +905,89 @@ def render_summary_turn(message: dict) -> None:
     st.markdown("Shall I submit this request?")
 
 
+def render_tag_technical_details(result) -> None:
+    with st.expander("🔧 Technical details (for platform / audit team)"):
+        sn_ref = servicenow_link_or_bold(result.approval.reference, result.approval.request_sys_id)
+        pr_line = (
+            f"- Pull request: {external_link(result.pull_request.html_url, f'#{result.pull_request.number}')} "
+            f"(branch `{result.pull_request.branch}`)\n"
+            if result.pull_request
+            else f"- Pull request: not yet raised. Will open on branch `{result.branch_name}` once approved\n"
+        )
+        st.markdown(
+            f"- Policy check: `{', '.join(result.policy_decision.policy_ids)}`\n"
+            f"- Resource: `{result.resource_id}` ({result.cloud.value.upper()})\n"
+            f"- Missing tags being added: `{', '.join(result.missing_keys)}`\n"
+            f"- ServiceNow request: {sn_ref} "
+            f"(request sys_id `{result.approval.request_sys_id}`, "
+            f"approval sys_id `{result.approval.approval_sys_id}`, state at creation `{result.approval.state}`)\n"
+            f"{pr_line}",
+            unsafe_allow_html=True,
+        )
+        st.code(result.iac_diff, language="hcl")
+
+
+def render_tag_summary_turn(message: dict) -> None:
+    d = message["draft"]
+    st.markdown("**Here's what I'll submit:**")
+    render_stat_chips(
+        [
+            ("Cloud", d["cloud"].value.upper()),
+            ("Resource", d["resource_id"]),
+            ("Missing tags", ", ".join(d["missing_keys"])),
+            ("Cost center", d["cost_center"]),
+        ]
+    )
+    # Plain markdown, no unsafe_allow_html: justification/resource_id/cost_center
+    # are raw user-typed text and must never be interpreted as HTML.
+    st.markdown(f"**Reason:** {d['justification']}")
+    st.markdown("Shall I submit this request?")
+
+
+def render_tag_result_turn(message: dict, index: int) -> None:
+    st.markdown(message["content"], unsafe_allow_html=True)
+    result = message["result"]
+    render_tag_technical_details(result)
+    render_pipeline_steps(message)
+
+    if message.get("rejected"):
+        return
+
+    cols = st.columns(2)
+    if cols[0].button("🔄 Refresh pipeline status", key=f"tag_refresh_{index}"):
+        with st.spinner("Checking ServiceNow. Opening the PR now if it's just been approved..."):
+            try:
+                result = tag_advance_pipeline(result)
+            except TagApprovalRejected as exc:
+                message["rejected"] = True
+                message["last_checked_approval"] = exc.state
+                st.rerun()
+                return
+
+            message["result"] = result
+            message["last_checked_approval"] = tag_check_approval_status(result.approval)
+            if result.pull_request is not None:
+                pr_state, build = tag_check_pipeline_status(result.pull_request)
+                message["last_checked_pr"] = pr_state
+                message["last_checked_build"] = build
+        st.rerun()
+
+    can_merge = (
+        result.pull_request is not None
+        and message.get("last_checked_approval") == "approved"
+        and message.get("last_checked_pr") != "merged"
+    )
+    if can_merge and cols[1].button("✅ Merge now", key=f"tag_merge_{index}"):
+        with st.spinner("Merging..."):
+            try:
+                merge_tag_remediation(result.approval, result.pull_request)
+                message["last_checked_pr"] = "merged"
+                st.success("Merged! The GitHub Actions pipeline will apply this shortly.")
+            except TagMergeNotAllowed as exc:
+                st.error(str(exc))
+        st.rerun()
+
+
 def render_incident_result_turn(message: dict, index: int) -> None:
     result = message["result"]
 
@@ -771,6 +1036,10 @@ def render_turn(message: dict, index: int) -> None:
             render_summary_turn(message)
         elif message["kind"] == "incident_result":
             render_incident_result_turn(message, index)
+        elif message["kind"] == "tag_summary":
+            render_tag_summary_turn(message)
+        elif message["kind"] == "tag_result":
+            render_tag_result_turn(message, index)
         else:
             st.markdown(message["content"])
 
@@ -783,12 +1052,15 @@ def render_step_controls(catalog: EntitlementCatalog) -> str | None:
     step = st.session_state.conv_step
 
     if step == "ask_intent":
-        cols = st.columns(2)
+        cols = st.columns(3)
         if cols[0].button("Request cloud access", key="intent_access"):
-            handle_intent_choice(True)
+            handle_intent_choice("access")
             st.rerun()
         if cols[1].button("Report an issue", key="intent_incident"):
-            handle_intent_choice(False)
+            handle_intent_choice("incident")
+            st.rerun()
+        if cols[2].button("Check tagging / compliance", key="intent_tags"):
+            handle_intent_choice("tags")
             st.rerun()
         return None
 
@@ -883,6 +1155,48 @@ def render_step_controls(catalog: EntitlementCatalog) -> str | None:
             st.rerun()
         return None
 
+    if step == "ask_tag_cloud":
+        cols = st.columns(2)
+        if cols[0].button("Azure", key="tag_cloud_azure"):
+            handle_tag_cloud_choice(Cloud.AZURE)
+            st.rerun()
+        if cols[1].button("GCP", key="tag_cloud_gcp"):
+            handle_tag_cloud_choice(Cloud.GCP)
+            st.rerun()
+        return None
+
+    if step == "ask_tag_env":
+        cols = st.columns(2)
+        if cols[0].button("Non-Prod", key="tag_env_nonprod"):
+            handle_tag_env_choice(Environment.NONPROD)
+            st.rerun()
+        if cols[1].button("Production", key="tag_env_prod"):
+            handle_tag_env_choice(Environment.PROD)
+            st.rerun()
+        return None
+
+    if step == "ask_tag_email":
+        return "Type your email address..."
+
+    if step == "ask_tag_resource":
+        return "Type the resource name..."
+
+    if step == "ask_tag_cost_center":
+        return "Type the cost-center code..."
+
+    if step == "ask_tag_justification":
+        return "Type a brief reason..."
+
+    if step == "tag_confirm":
+        cols = st.columns(2)
+        if cols[0].button("✅ Yes, submit it", key="tag_confirm_yes"):
+            handle_tag_confirm(True)
+            st.rerun()
+        if cols[1].button("✋ No, cancel", key="tag_confirm_no"):
+            handle_tag_confirm(False)
+            st.rerun()
+        return None
+
     return None
 
 
@@ -937,6 +1251,14 @@ def main() -> None:
                 handle_incident_window_input(prompt)
             elif step == "ask_incident_justification":
                 handle_incident_justification_input(prompt)
+            elif step == "ask_tag_email":
+                handle_tag_email_input(prompt)
+            elif step == "ask_tag_resource":
+                handle_tag_resource_input(prompt)
+            elif step == "ask_tag_cost_center":
+                handle_tag_cost_center_input(prompt)
+            elif step == "ask_tag_justification":
+                handle_tag_justification_input(prompt)
             else:
                 user_says(prompt)
                 bot_says("Please use the buttons above to continue.")

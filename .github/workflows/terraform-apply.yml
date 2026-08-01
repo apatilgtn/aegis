@@ -17,6 +17,7 @@ on:
     branches: [main]
     paths:
       - "infra/access-grants/**"
+      - "infra/tag-remediations/**"
       - ".github/workflows/terraform-apply.yml"
 
 permissions:
@@ -24,7 +25,7 @@ permissions:
   contents: read
 
 jobs:
-  gcp-apply:
+  gcp-apply-access-grants:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,4 +51,32 @@ jobs:
 
       - name: terraform apply
         working-directory: infra/access-grants
+        run: terraform apply -auto-approve tfplan
+
+  gcp-apply-tag-remediations:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ual-demo-af168
+          workload_identity_provider: "projects/225619639749/locations/global/workloadIdentityPools/aegis-github-pool/providers/aegis-github-provider"
+          service_account: "aegis-pipeline@ual-demo-af168.iam.gserviceaccount.com"
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: terraform init
+        working-directory: infra/tag-remediations
+        run: terraform init
+
+      - name: terraform plan
+        working-directory: infra/tag-remediations
+        run: terraform plan -out=tfplan
+
+      - name: terraform apply
+        working-directory: infra/tag-remediations
         run: terraform apply -auto-approve tfplan

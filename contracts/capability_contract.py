@@ -139,3 +139,39 @@ class IncidentTriageResult(BaseModel):
     incident: IncidentRef | None = Field(
         default=None, description="Set only once the human confirms raising it"
     )
+
+
+# ---- Capability: tag_remediation -------------------------------------------------
+
+class TagRef(BaseModel):
+    key: str
+    value: str
+
+
+class TagComplianceRequest(BaseModel):
+    capability: Literal["tag_remediation"] = "tag_remediation"
+    requester: str = Field(description="Identity of the human who asked the agent, e.g. UPN or email")
+    cloud: Cloud
+    environment: Environment
+    resource_id: str = Field(description="Cloud-native resource name to check/remediate, e.g. a GCS bucket name")
+    cost_center: str = Field(min_length=2, description="Cost-center code to apply as a required tag")
+    justification: str = Field(min_length=10)
+
+
+class TagRemediationResult(BaseModel):
+    capability: Literal["tag_remediation"] = "tag_remediation"
+    cloud: Cloud
+    resource_id: str
+    current_tags: list[TagRef]
+    missing_keys: list[str] = Field(description="Required keys (see data/tag_policy.yaml) absent from current_tags")
+    proposed_tags: list[TagRef]
+    iac_diff: str = Field(description="Terraform HCL diff — not opened as a PR until approved")
+    branch_name: str = Field(description="Branch the PR will be opened on, once approved")
+    file_path: str = Field(description="Repo path the diff will be committed to, once approved")
+    pr_title: str
+    pr_body: str
+    policy_decision: PolicyDecision
+    approval: ApprovalRef
+    pull_request: PullRequestRef | None = Field(
+        default=None, description="Set only after ServiceNow approval — never exists before then"
+    )

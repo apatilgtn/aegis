@@ -55,7 +55,7 @@ def _request(method: str, path: str, token: str, **kwargs) -> dict:
     return response.json()
 
 
-def open_access_grant_pr(
+def open_pull_request(
     branch_name: str,
     file_path: str,
     file_content: str,
@@ -63,6 +63,9 @@ def open_access_grant_pr(
     pr_body: str,
     base_branch: str = "main",
 ) -> PullRequestRef:
+    """Opens a branch, commits the generated Terraform diff, and opens a PR —
+    shared by every capability that proposes an IaC change (access_grant,
+    tag_remediation, ...); nothing here is specific to one capability."""
     repo, token = _config()
 
     base_ref = _request("GET", f"/repos/{repo}/git/ref/heads/{base_branch}", token)
@@ -80,7 +83,7 @@ def open_access_grant_pr(
         f"/repos/{repo}/contents/{file_path}",
         token,
         json={
-            "message": f"Add access grant: {pr_title}",
+            "message": f"Aegis: {pr_title}",
             "content": base64.b64encode(file_content.encode()).decode(),
             "branch": branch_name,
         },

@@ -1,0 +1,8 @@
+# Required tags — the deterministic source of truth for what tag_remediation
+# checks for and proposes. A resource is compliant once every key here has a
+# value; the agent never invents a required key that isn't listed here.
+
+required_keys:
+  - owner
+  - cost-center
+  - environment

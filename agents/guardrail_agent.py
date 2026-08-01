@@ -19,11 +19,14 @@ from pathlib import Path
 
 import regopy
 
-from contracts.capability_contract import AccessGrantRequest, PolicyDecision
+from contracts.capability_contract import AccessGrantRequest, PolicyDecision, TagComplianceRequest
 from contracts.entitlement_catalog import EntitlementCatalogEntry
 
 _POLICY_PATH = Path(__file__).parents[1] / "policy" / "access_grant.rego"
 _POLICY_ID = "aegis.access_grant"
+
+_TAG_POLICY_PATH = Path(__file__).parents[1] / "policy" / "tag_remediation.rego"
+_TAG_POLICY_ID = "aegis.tag_remediation"
 
 
 def evaluate_access_grant(
@@ -51,5 +54,26 @@ def evaluate_access_grant(
     return PolicyDecision(
         allowed=result["allow"],
         policy_ids=[_POLICY_ID],
+        reasons=result["deny"],
+    )
+
+
+def evaluate_tag_remediation(request: TagComplianceRequest) -> PolicyDecision:
+    rego = regopy.Interpreter()
+    rego.add_module("tag_remediation", _TAG_POLICY_PATH.read_text())
+    rego.set_input(
+        {
+            "request": {
+                "environment": request.environment.value,
+                "cost_center": request.cost_center,
+                "justification": request.justification,
+            }
+        }
+    )
+    result = json.loads(str(rego.query(f"data.{_TAG_POLICY_ID}")))["expressions"][0]
+
+    return PolicyDecision(
+        allowed=result["allow"],
+        policy_ids=[_TAG_POLICY_ID],
         reasons=result["deny"],
     )

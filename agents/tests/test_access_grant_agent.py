@@ -47,10 +47,10 @@ def stub_github(monkeypatch):
     mcp_servers/github/client.py) — unit tests must not open real PRs on
     every run."""
 
-    def fake_open_access_grant_pr(**kwargs):
+    def fake_open_pull_request(**kwargs):
         return FAKE_PR
 
-    monkeypatch.setattr("agents.access_grant_agent.open_access_grant_pr", fake_open_access_grant_pr)
+    monkeypatch.setattr("agents.access_grant_agent.open_pull_request", fake_open_pull_request)
 
 
 @pytest.fixture(scope="module")
@@ -175,7 +175,7 @@ def test_advance_pipeline_is_a_noop_once_pr_already_exists(catalog, valid_reques
     first = advance_pipeline(result)
 
     monkeypatch.setattr(
-        "agents.access_grant_agent.open_access_grant_pr",
+        "agents.access_grant_agent.open_pull_request",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not open a second PR")),
     )
 
