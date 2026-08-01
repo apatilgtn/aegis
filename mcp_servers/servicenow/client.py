@@ -51,6 +51,11 @@ class AccessRequestRef(BaseModel):
     approval_state: str
 
 
+class IncidentRecordRef(BaseModel):
+    number: str
+    sys_id: str
+
+
 def _config() -> tuple[str, str, str]:
     missing = [name for name in _REQUIRED_ENV_VARS if not os.getenv(name)]
     if missing:
@@ -123,6 +128,20 @@ def create_access_request(short_description: str, description: str, justificatio
         approval_sys_id=approval_task["sys_id"],
         approval_state=approval_task["state"],
     )
+
+
+def create_incident(short_description: str, description: str, urgency: str = "3") -> IncidentRecordRef:
+    """Raises a ServiceNow incident directly — unlike create_access_request,
+    there is no approval task to create, because raising the incident IS the
+    action (investigating/tracking an issue), not a request for permission
+    to change something. urgency follows ServiceNow's native scale:
+    "1" (high) .. "3" (low).
+    """
+    result = _post(
+        "incident",
+        {"short_description": short_description, "description": description, "urgency": urgency},
+    )
+    return IncidentRecordRef(number=result["number"], sys_id=result["sys_id"])
 
 
 def get_approval_state(approval_sys_id: str) -> str:

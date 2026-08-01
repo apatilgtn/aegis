@@ -102,5 +102,40 @@ class AccessGrantResult(BaseModel):
     expires_at: datetime
 
 
-CapabilityRequest = AccessGrantRequest
-CapabilityResult = AccessGrantResult
+# ---- Capability: incident_triage -------------------------------------------------
+
+class IncidentTriageRequest(BaseModel):
+    capability: Literal["incident_triage"] = "incident_triage"
+    requester: str = Field(description="Identity of the human who asked the agent, e.g. UPN or email")
+    cloud: Cloud
+    resource_hint: str = Field(description="Free-text service/resource name to scope the log search, e.g. 'payments-api'")
+    time_window_hours: int = Field(gt=0, le=168)
+    justification: str = Field(min_length=10)
+
+
+class LogFinding(BaseModel):
+    timestamp: datetime
+    severity: str
+    message: str
+
+
+class IncidentRef(BaseModel):
+    """The ServiceNow incident raised from a triage — never the fix itself.
+    Unlike ApprovalRef, there is no approval gate: raising an incident is the
+    action, not a request for permission to act, so this is only ever set
+    after the human explicitly confirms via raise_incident()."""
+
+    system: Literal["servicenow"] = "servicenow"
+    number: str = Field(description="Human-facing incident number, e.g. INC0012345")
+    sys_id: str
+
+
+class IncidentTriageResult(BaseModel):
+    capability: Literal["incident_triage"] = "incident_triage"
+    cloud: Cloud
+    resource_hint: str
+    findings: list[LogFinding]
+    summary: str = Field(description="Plain-language root-cause summary, deterministically generated (no LLM)")
+    incident: IncidentRef | None = Field(
+        default=None, description="Set only once the human confirms raising it"
+    )

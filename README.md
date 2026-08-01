@@ -1,6 +1,6 @@
 # Aegis — Agentic Cloud Governance Plane
 
-Aegis is a natural-language agent that handles everyday cloud operations (starting with access requests) across Azure and GCP — **without ever being able to touch cloud infrastructure directly.** It can only *propose* changes as Terraform pull requests and *request* approvals through ServiceNow. A human has to approve the request **and** merge the PR before anything is applied. Nothing in this system has a write credential to any cloud.
+Aegis is a natural-language agent that handles everyday cloud operations across Azure and GCP — **without ever being able to touch cloud infrastructure directly.** For access requests, it can only *propose* changes as Terraform pull requests and *request* approvals through ServiceNow; a human has to approve the request **and** merge the PR before anything is applied. For incident investigation, it can only read logs and raise a ServiceNow ticket — it has no write credential to any cloud, for either capability.
 
 Built for the IEP Techathon: Agentic AI Hackathon 2026 (Anand Patil, Beyond Bank Australia). The original pitch is in [`Aegis-Agentic-Cloud-Governance-Solution-Design.docx`](./Aegis-Agentic-Cloud-Governance-Solution-Design.docx); this README documents what has actually been built and verified against real systems, which in a few places is more concrete than the original design (real ServiceNow, real GCP, real CI/CD), and in one place is simpler than it (the "orchestrator" is currently a deterministic guided conversation, not an LLM call — see [Honest status](#honest-status-real-vs-mocked-vs-not-yet-built) below).
 
@@ -34,7 +34,11 @@ The cloud-neutrality claim is real, not aspirational: the same `handle_access_gr
 
 ## How the chatbot works for a user
 
-There's no form. Every field is a turn in the conversation:
+There's no form. Every field is a turn in the conversation. The first turn is always the same regardless of which capability the user ends up in:
+
+0. **"What would you like to do: request cloud access, or report an issue?"** — this single button choice branches into one of the two flows below.
+
+### Access request flow
 
 1. **"Which cloud?"** — Azure or GCP (button choice)
 2. **"Which environment?"** — Non-Prod or Production (Production is explained as unavailable and redirected to Non-Prod)
@@ -51,7 +55,22 @@ There's no form. Every field is a turn in the conversation:
 10. **"Merge now"** — appears once approved. Clicking it re-checks approval server-side (never trusts a stale UI value) and merges the PR
 11. **GitHub Actions** picks up the merge and runs `terraform apply` for real. The same "Refresh pipeline status" button shows the live build result once merged
 
-The chat only ever writes to ServiceNow and GitHub (proposals and approvals); it has no credential capable of writing to Azure or GCP directly.
+The chat only ever writes to ServiceNow and GitHub (proposals and approvals) for this flow; it has no credential capable of writing to Azure or GCP directly.
+
+### Incident triage flow
+
+1. **"Which cloud?"** — Azure or GCP (button choice)
+2. **"What's your email?"** — free text, recorded as the requester
+3. **"What service or resource?"** — free text, e.g. `payments-api` — scopes the log search
+4. **Time window** — preset buttons (last 1h / 24h / 7 days) or free text
+5. **Justification** — free text, minimum 10 characters, explaining why the investigation is needed
+6. **Aegis searches logs immediately** — no approval needed, since reading logs changes nothing:
+   - GCP: a real Cloud Logging query, filtered to WARNING severity and above
+   - Azure: a mocked Azure Monitor lookup (no Azure tenant credentials in this environment)
+7. **Findings + summary** — up to 20 matching log entries in an expandable list, plus a deterministically generated (no LLM) plain-language summary: severity breakdown and the most frequent or most recent message
+8. **"Raise incident" / "No thanks"** — raising is immediate and needs no approval, since nothing changes in any cloud; declining just ends the conversation
+
+This flow only ever writes to ServiceNow (the incident record itself); it never touches GitHub, since there is no infrastructure change to propose.
 
 ## Honest status: real vs. mocked vs. not-yet-built
 
@@ -63,8 +82,11 @@ The chat only ever writes to ServiceNow and GitHub (proposals and approvals); it
 | GCP IAM write (`terraform apply`) | **Real.** GitHub Actions authenticates via Workload Identity Federation (no service account key) as `aegis-pipeline` (`roles/resourcemanager.projectIamAdmin`, scoped to one project). Verified end-to-end multiple times, including by the project owner testing with their own Google account |
 | CI/CD pipeline | **Real**, on GitHub Actions (not Cloud Build — deliberately switched so the same workflow shape extends to Azure or any other cloud as another job) |
 | Azure identity/group membership | **Mocked.** No Azure tenant credentials exist in this environment; `mcp_servers/azure_entra/directory_service.py` is an in-memory stand-in with the same function signatures a real Graph API client would have |
-| Natural-language understanding | **Not an LLM call.** The original design envisions an LLM-driven orchestrator; what's built is a deterministic guided conversation (buttons + short free-text fields) that produces the same `AccessGrantRequest` contract. Swapping in a real LLM means replacing the conversation's input-gathering step, not redesigning anything downstream |
-| Other capabilities (cost/FinOps, tagging, incident triage) | **Not built.** Only `access_grant` (and its read-only sibling `access_check`) exist |
+| Natural-language understanding | **Not an LLM call.** The original design envisions an LLM-driven orchestrator; what's built is a deterministic guided conversation (buttons + short free-text fields) that produces the same `AccessGrantRequest`/`IncidentTriageRequest` contract. Swapping in a real LLM means replacing the conversation's input-gathering step, not redesigning anything downstream |
+| Incident triage: GCP log search | **Real.** Live Cloud Logging query via the same read-only `aegis-reader` service account (`roles/logging.viewer`, already granted — no new permission needed) |
+| Incident triage: Azure log search | **Mocked.** No Azure tenant credentials exist in this environment; `mcp_servers/azure_monitor/log_lookup.py` returns canned findings for a couple of known resource hints, same function signature a real Azure Monitor client would have |
+| Incident triage: incident creation | **Real.** Creates an actual `incident` record on the same live ServiceNow PDI, immediately on human confirmation — simpler than the access-grant path since there's no approval task and no downstream pipeline |
+| Other capabilities (cost/FinOps, tagging) | **Not built.** `access_grant`, `access_check`, and `incident_triage` exist |
 
 ## Repository layout
 
@@ -77,12 +99,15 @@ agents/               Capability agents (business logic, no I/O of its own)
   guardrail_agent.py       Calls the Rego policy, returns a PolicyDecision
   access_grant_agent.py    handle_access_grant, advance_pipeline, merge_access_grant, status checks
   access_check_agent.py    "What access do I currently have" — read-only
+  incident_triage_agent.py triage_incident, raise_incident — no policy gate, no PR pipeline
   terraform_render.py      Renders the HCL diff for a resolved entitlement
 
 mcp_servers/          One subfolder per external system, real client + FastMCP tool server
   azure_entra/             Mocked directory (no real tenant)
   gcp_resource_manager/    Real project/IAM lookups
-  servicenow/              Real ServiceNow client
+  gcp_logging/             Real Cloud Logging queries (incident triage)
+  azure_monitor/           Mocked log lookups (no real tenant)
+  servicenow/              Real ServiceNow client (access requests + incidents)
   github/                  Real GitHub client (branch/commit/PR/merge/status)
 
 policy/               OPA/Rego guardrail policy + tests
@@ -112,7 +137,7 @@ Secrets live in `.env` (gitignored) and, for GCP, a service account key under `.
 python3 -m pytest -q
 ```
 
-29 tests across contracts, the entitlement catalog, the guardrail policy (evaluated for real against the actual `.rego` file via `regopy`, not mocked), and both capability agents. External calls (ServiceNow, GitHub) are stubbed in the automated suite so running tests never creates real tickets or PRs — the real integrations are verified separately via live scripted runs, several of which resulted in genuine, confirmed GCP IAM grants.
+38 tests across contracts, the entitlement catalog, the guardrail policy (evaluated for real against the actual `.rego` file via `regopy`, not mocked), and all three capability agents. External calls (ServiceNow, GitHub) are stubbed in the automated suite so running tests never creates real tickets, incidents, or PRs — the real integrations are verified separately via live scripted runs, several of which resulted in genuine, confirmed GCP IAM grants and ServiceNow incidents.
 
 ## Security notes
 

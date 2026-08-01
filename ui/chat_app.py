@@ -45,7 +45,8 @@ from agents.access_grant_agent import (
     handle_access_grant,
     merge_access_grant,
 )
-from contracts.capability_contract import AccessGrantRequest, Cloud, Environment, Tier
+from agents.incident_triage_agent import IncidentRequestFailed, raise_incident, triage_incident
+from contracts.capability_contract import AccessGrantRequest, Cloud, Environment, IncidentTriageRequest, Tier
 from contracts.entitlement_catalog import EntitlementCatalog, EntitlementCatalogEntry
 
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "data" / "entitlement_catalog.yaml"
@@ -275,6 +276,16 @@ def servicenow_link_or_bold(reference: str, request_sys_id: str) -> str:
     return external_link(url, reference) if url else f"<strong>{reference}</strong>"
 
 
+def servicenow_incident_url(sys_id: str) -> str | None:
+    instance_url = os.getenv("SN_INSTANCE_URL", "")
+    return f"{instance_url}/incident.do?sys_id={sys_id}" if instance_url else None
+
+
+def servicenow_incident_link_or_bold(number: str, sys_id: str) -> str:
+    url = servicenow_incident_url(sys_id)
+    return external_link(url, number) if url else f"<strong>{number}</strong>"
+
+
 def render_stat_chips(pairs: list[tuple[str, str]]) -> None:
     """Renders the colored stat-chip row. Only ever called with system
     values (cloud names, tiers, durations) — never raw user-typed text —
@@ -293,13 +304,13 @@ def render_stat_chips(pairs: list[tuple[str, str]]) -> None:
 def init_state() -> None:
     if "conv_step" in st.session_state:
         return
-    st.session_state.conv_step = "ask_cloud"
+    st.session_state.conv_step = "ask_intent"
     st.session_state.draft = {}
     st.session_state.messages = [
         text_turn(
             "assistant",
-            "Hi, I'm **Aegis** ⚡. I can check your current cloud access or help you request new "
-            "access. Nothing is ever applied without human approval.\n\nFirst: which cloud, Azure or GCP?",
+            "Hi, I'm **Aegis** ⚡. Nothing is ever applied without human approval.\n\n"
+            "What would you like to do: request cloud access, or report an issue?",
         )
     ]
 
@@ -310,6 +321,17 @@ def text_turn(role: str, content: str) -> dict:
 
 def summary_turn(draft: dict) -> dict:
     return {"kind": "summary", "role": "assistant", "draft": dict(draft)}
+
+
+def incident_result_turn(result, requester: str, justification: str) -> dict:
+    return {
+        "kind": "incident_result",
+        "role": "assistant",
+        "result": result,
+        "requester": requester,
+        "justification": justification,
+        "declined": False,
+    }
 
 
 def result_turn(content: str, result) -> dict:
@@ -334,14 +356,87 @@ def user_says(text: str) -> None:
 
 
 def reset_conversation() -> None:
-    st.session_state.conv_step = "ask_cloud"
+    st.session_state.conv_step = "ask_intent"
     st.session_state.draft = {}
     st.session_state.messages = [
-        text_turn("assistant", "Let's start over. Which cloud, Azure or GCP?")
+        text_turn("assistant", "Let's start over. What would you like to do: request cloud access, or report an issue?")
     ]
 
 
-# ---- step handlers ----------------------------------------------------------------
+# ---- intent selection ----------------------------------------------------------------
+
+def handle_intent_choice(wants_access: bool) -> None:
+    if wants_access:
+        user_says("Request cloud access")
+        st.session_state.conv_step = "ask_cloud"
+        bot_says("Which cloud, Azure or GCP?")
+    else:
+        user_says("Report an issue")
+        st.session_state.conv_step = "ask_incident_cloud"
+        bot_says("Which cloud is affected, Azure or GCP?")
+
+
+# ---- step handlers: incident_triage ------------------------------------------------
+
+def handle_incident_cloud_choice(cloud: Cloud) -> None:
+    user_says(cloud.value.upper())
+    st.session_state.draft["cloud"] = cloud
+    st.session_state.conv_step = "ask_incident_email"
+    bot_says("What's your email address?")
+
+
+def handle_incident_email_input(email: str) -> None:
+    user_says(email)
+    if "@" not in email:
+        bot_says("That doesn't look like a valid email. Could you try again?")
+        return
+    st.session_state.draft["email"] = email
+    st.session_state.conv_step = "ask_resource_hint"
+    bot_says('What\'s the affected service or resource? (a short name, e.g. "payments-api")')
+
+
+def handle_resource_hint_input(text: str) -> None:
+    if len(text.strip()) == 0:
+        bot_says("I need at least a short name to search for. What's the affected service or resource?")
+        return
+    user_says(text)
+    st.session_state.draft["resource_hint"] = text.strip()
+    st.session_state.conv_step = "ask_incident_window"
+    bot_says("How many hours back should I look? (max 168)")
+
+
+def handle_incident_window_input(text: str) -> None:
+    match = re.search(r"(\d+)", text)
+    if not match or not (1 <= int(match.group(1)) <= 168):
+        bot_says("Please give me a number of hours between 1 and 168.")
+        return
+
+    user_says(text)
+    st.session_state.draft["time_window_hours"] = int(match.group(1))
+    st.session_state.conv_step = "ask_incident_justification"
+    bot_says("What prompted this investigation? (a brief reason)")
+
+
+def handle_incident_justification_input(text: str) -> None:
+    user_says(text)
+    if len(text.strip()) < 10:
+        bot_says("Could you give a bit more detail (at least 10 characters)?")
+        return
+
+    d = st.session_state.draft
+    request = IncidentTriageRequest(
+        requester=d["email"],
+        cloud=d["cloud"],
+        resource_hint=d["resource_hint"],
+        time_window_hours=d["time_window_hours"],
+        justification=text.strip(),
+    )
+    result = triage_incident(request)
+    st.session_state.messages.append(incident_result_turn(result, d["email"], text.strip()))
+    st.session_state.conv_step = "idle_done"
+
+
+# ---- step handlers: access_grant ---------------------------------------------------
 
 def handle_cloud_choice(cloud: Cloud) -> None:
     user_says(cloud.value.upper())
@@ -628,12 +723,54 @@ def render_summary_turn(message: dict) -> None:
     st.markdown("Shall I submit this request?")
 
 
+def render_incident_result_turn(message: dict, index: int) -> None:
+    result = message["result"]
+
+    # Plain markdown throughout: resource_hint/justification are user-typed,
+    # and log messages come from external systems (GCP/Azure) — neither is
+    # trusted enough to render as HTML. Only the incident link below (a
+    # system-generated number + sys_id) gets unsafe_allow_html.
+    if result.findings:
+        st.markdown(f"**{len(result.findings)} log entries found for `{result.resource_hint}` ({result.cloud.value.upper()}):**")
+        with st.expander("🔍 Log findings"):
+            for finding in result.findings[:20]:
+                st.markdown(f"- `{finding.timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')}` **{finding.severity}**: {finding.message}")
+    else:
+        st.markdown(f"**No matching log entries for `{result.resource_hint}` ({result.cloud.value.upper()}).**")
+
+    st.markdown(f"**Summary:** {result.summary}")
+
+    if result.incident:
+        ref = servicenow_incident_link_or_bold(result.incident.number, result.incident.sys_id)
+        st.markdown(f"✅ Incident {ref} raised (opens in a new tab).", unsafe_allow_html=True)
+        return
+
+    if message["declined"]:
+        st.caption("No incident was raised.")
+        return
+
+    st.caption("Raising an incident is immediate: it needs no approval, since nothing changes in any cloud.")
+    cols = st.columns(2)
+    if cols[0].button("🚨 Raise incident", key=f"raise_incident_{index}"):
+        with st.spinner("Raising incident in ServiceNow..."):
+            try:
+                message["result"] = raise_incident(result, message["requester"], message["justification"])
+            except IncidentRequestFailed as exc:
+                st.error(str(exc))
+        st.rerun()
+    if cols[1].button("No thanks", key=f"skip_incident_{index}"):
+        message["declined"] = True
+        st.rerun()
+
+
 def render_turn(message: dict, index: int) -> None:
     with st.chat_message(message["role"]):
         if message["kind"] == "result":
             render_result_turn(message, index)
         elif message["kind"] == "summary":
             render_summary_turn(message)
+        elif message["kind"] == "incident_result":
+            render_incident_result_turn(message, index)
         else:
             st.markdown(message["content"])
 
@@ -644,6 +781,43 @@ def render_step_controls(catalog: EntitlementCatalog) -> str | None:
     """Renders buttons for the current step, if any. Returns a placeholder
     string for the chat_input, used generically for free-text steps."""
     step = st.session_state.conv_step
+
+    if step == "ask_intent":
+        cols = st.columns(2)
+        if cols[0].button("Request cloud access", key="intent_access"):
+            handle_intent_choice(True)
+            st.rerun()
+        if cols[1].button("Report an issue", key="intent_incident"):
+            handle_intent_choice(False)
+            st.rerun()
+        return None
+
+    if step == "ask_incident_cloud":
+        cols = st.columns(2)
+        if cols[0].button("Azure", key="incident_cloud_azure"):
+            handle_incident_cloud_choice(Cloud.AZURE)
+            st.rerun()
+        if cols[1].button("GCP", key="incident_cloud_gcp"):
+            handle_incident_cloud_choice(Cloud.GCP)
+            st.rerun()
+        return None
+
+    if step == "ask_incident_email":
+        return "Type your email address..."
+
+    if step == "ask_resource_hint":
+        return 'e.g. "payments-api"'
+
+    if step == "ask_incident_window":
+        cols = st.columns(3)
+        for i, (col, preset) in enumerate(zip(cols, (1, 24, 168))):
+            if col.button(f"{preset}h", key=f"incident_window_preset_{i}"):
+                handle_incident_window_input(str(preset))
+                st.rerun()
+        return "Or type how many hours..."
+
+    if step == "ask_incident_justification":
+        return "Type a brief reason..."
 
     if step == "ask_cloud":
         cols = st.columns(2)
@@ -755,6 +929,14 @@ def main() -> None:
                 handle_duration_input(prompt)
             elif step == "ask_justification":
                 handle_justification_input(prompt, catalog)
+            elif step == "ask_incident_email":
+                handle_incident_email_input(prompt)
+            elif step == "ask_resource_hint":
+                handle_resource_hint_input(prompt)
+            elif step == "ask_incident_window":
+                handle_incident_window_input(prompt)
+            elif step == "ask_incident_justification":
+                handle_incident_justification_input(prompt)
             else:
                 user_says(prompt)
                 bot_says("Please use the buttons above to continue.")
