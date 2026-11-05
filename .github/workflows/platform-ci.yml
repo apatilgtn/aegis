@@ -1,0 +1,79 @@
+name: Platform CI
+
+on:
+  pull_request:
+    paths:
+      - "agents/**"
+      - "contracts/**"
+      - "mcp_servers/**"
+      - "policy/**"
+      - "scripts/**"
+      - "worker/**"
+      - "modules/**"
+      - "infra/**"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "requirements.lock"
+      - ".github/workflows/platform-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "agents/**"
+      - "contracts/**"
+      - "mcp_servers/**"
+      - "policy/**"
+      - "scripts/**"
+      - "worker/**"
+      - "modules/**"
+      - "infra/**"
+      - "docker-compose.yml"
+      - "requirements.txt"
+      - "requirements.lock"
+      - ".github/workflows/platform-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: python -m pip install --requirement requirements.lock
+      - run: python -m pip check
+      - run: python -m pytest -q
+      - run: python -m py_compile worker/worker.py
+      - run: python -m py_compile scripts/p0_e2e.py
+
+  policy-and-compose:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_URL: https://example.supabase.co
+      SUPABASE_PUBLISHABLE_KEY: sb_publishable_ci_placeholder
+      SUPABASE_SECRET_KEY: sb_secret_ci_placeholder
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker run --rm -v "$PWD/policy:/policies:ro" openpolicyagent/opa:1.8.0-static test /policies
+      - run: docker compose config --quiet
+
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+      - name: Validate root modules
+        shell: bash
+        run: |
+          set -euo pipefail
+          for directory in infra/access-grants infra/tag-remediations; do
+            terraform -chdir="$directory" init -backend=false -input=false
+            terraform -chdir="$directory" validate
+          done

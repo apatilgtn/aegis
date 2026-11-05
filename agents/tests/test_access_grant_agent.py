@@ -6,13 +6,12 @@ from agents.access_grant_agent import (
     AccessGrantDenied,
     AlreadyGrantedError,
     ApprovalRejected,
-    MergeNotAllowed,
     advance_pipeline,
     check_approval_status,
     check_pull_request_status,
     handle_access_grant,
-    merge_access_grant,
 )
+from agents.terraform_render import render_access_grant_diff
 from contracts.capability_contract import AccessGrantRequest, Cloud, Environment, PullRequestRef, Tier
 from contracts.entitlement_catalog import EntitlementCatalog, EntitlementNotFoundError
 from mcp_servers.azure_entra.directory_service import PrincipalNotFoundError
@@ -83,7 +82,7 @@ def test_allowed_request_produces_azure_diff_with_no_pr_yet(catalog, valid_reque
     assert result.pull_request is None  # not raised until approved
     assert "azuread" not in result.iac_diff  # module call site, not the module internals
     assert 'source           = "../../modules/azure/entra_group_membership"' in result.iac_diff
-    assert "jane.doe@example.com" in result.iac_diff  # header metadata
+    assert "jane.doe@example.com" not in result.iac_diff  # identity is resolved before rendering
     assert "11111111-1111-1111-1111-111111111111" in result.iac_diff  # resolved object ID, not the UPN
 
 
@@ -197,25 +196,20 @@ def test_check_pull_request_status_polls_the_pr_number(catalog, valid_request, m
     assert check_pull_request_status(result.pull_request) == "merged"
 
 
-def test_merge_access_grant_refuses_when_not_approved(catalog, valid_request, monkeypatch):
-    result = handle_access_grant(valid_request, Cloud.AZURE, catalog)
-    approve(monkeypatch)
-    result = advance_pipeline(result)
+def test_access_agent_exposes_no_merge_capability():
+    import agents.access_grant_agent as agent
+    import mcp_servers.github.client as github
 
-    monkeypatch.setattr("agents.access_grant_agent.get_approval_state", lambda approval_sys_id: "requested")
-
-    with pytest.raises(MergeNotAllowed):
-        merge_access_grant(result.approval, result.pull_request)
+    assert not hasattr(agent, "merge_access_grant")
+    assert not hasattr(github, "merge_pull_request")
 
 
-def test_merge_access_grant_merges_when_approved(catalog, valid_request, monkeypatch):
-    result = handle_access_grant(valid_request, Cloud.AZURE, catalog)
-    approve(monkeypatch)
-    result = advance_pipeline(result)
+def test_access_hcl_escapes_untrusted_values(catalog, valid_request):
+    request = valid_request.model_copy(update={"requester": 'jane"\nresource "null_resource" "owned" {}@example.com'})
+    entry = catalog.resolve(request.business_unit, request.environment, request.tier, Cloud.AZURE)
 
-    monkeypatch.setattr(
-        "agents.access_grant_agent.merge_pull_request",
-        lambda pr_number: "abc123sha" if pr_number == 9999 else "wrong-pr-used",
-    )
+    rendered = render_access_grant_diff(request, entry, member_object_id='object"\nvalue')
 
-    assert merge_access_grant(result.approval, result.pull_request) == "abc123sha"
+    assert 'object\\"\\nvalue' in rendered
+    assert 'object"\nvalue' not in rendered
+    assert '\nresource "null_resource"' not in rendered

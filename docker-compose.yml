@@ -1,0 +1,69 @@
+name: aegis-local
+
+services:
+  opa:
+    image: openpolicyagent/opa:1.8.0-static
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "/policies"]
+    volumes:
+      - ./policy:/policies:ro
+    ports:
+      - "8181:8181"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-84f88ae4-dfca-4a04-bae5-700c4c667650}
+      INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-3e184311-abb6-4588-9b8b-09f89b219eac}
+      INFISICAL_API_URL: ${INFISICAL_API_URL:-https://app.infisical.com}
+      INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}
+      INFISICAL_SECRET_PATH: ${INFISICAL_SECRET_PATH:-/}
+      INFISICAL_CLIENT_SECRET_FILE: /run/secrets/infisical_client_secret
+      OPA_URL: http://opa:8181
+      WORKER_ID: ${WORKER_ID:-aegis-local-worker}
+      POLL_SECONDS: ${POLL_SECONDS:-2}
+      HEARTBEAT_SECONDS: ${HEARTBEAT_SECONDS:-30}
+      LEASE_EXTENSION_SECONDS: ${LEASE_EXTENSION_SECONDS:-120}
+      HOME: /tmp
+    secrets:
+      - infisical_client_secret
+    tmpfs:
+      - /tmp:mode=1777
+    depends_on:
+      - opa
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  portal:
+    build:
+      context: .
+      dockerfile: portal/Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+    environment:
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL}
+      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - opa
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+secrets:
+  infisical_client_secret:
+    file: ${INFISICAL_CLIENT_SECRET_FILE:-.secrets/infisical-client-secret}

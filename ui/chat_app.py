@@ -20,10 +20,8 @@ ask_intent branches into one of three state machines (st.session_state.conv_step
                         -> ask_tag_justification -> tag_confirm -> tag_done
 
 "done"/"tag_done" are not dead ends: the submitted request's chat turn carries
-its own "Refresh pipeline status" and (once approved) "Merge now" actions, so
-the whole propose -> approve -> merge -> apply loop is followable from the
-chat without leaving it — merging is still a deliberate human click, just one
-that lives here instead of on GitHub.
+its own "Refresh pipeline status" action. Merging is deliberately available
+only in GitHub behind branch protection and independent review.
 """
 
 from __future__ import annotations
@@ -32,6 +30,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -43,28 +42,25 @@ from agents.access_grant_agent import (
     AlreadyGrantedError,
     ApprovalRejected,
     ApprovalRequestFailed,
-    MergeNotAllowed,
     PullRequestFailed,
     advance_pipeline,
     check_approval_status,
     check_pipeline_status,
     handle_access_grant,
-    merge_access_grant,
 )
 from agents.incident_triage_agent import IncidentRequestFailed, raise_incident, triage_incident
 from agents.tag_remediation_agent import (
     AlreadyCompliantError,
     ApprovalRejected as TagApprovalRejected,
     ApprovalRequestFailed as TagApprovalRequestFailed,
-    MergeNotAllowed as TagMergeNotAllowed,
     TagRemediationDenied,
     advance_pipeline as tag_advance_pipeline,
     check_approval_status as tag_check_approval_status,
     check_pipeline_status as tag_check_pipeline_status,
     check_tag_compliance,
     handle_tag_remediation,
-    merge_tag_remediation,
 )
+from agents.tag_render import UnsafeIaCOwnershipError
 from contracts.capability_contract import (
     AccessGrantRequest,
     Cloud,
@@ -265,8 +261,6 @@ PR_STATE_LABELS = {
     "closed": "❌ Closed without merging",
 }
 
-CHIP_COLORS = ["#F0C64A", "#F6D3E4", "#DAD6F5", "#B7F0C4"]
-
 BUILD_STATUS_LABELS = {
     "queued": "🟡 Queued",
     "in_progress": "🟡 Running",
@@ -287,9 +281,15 @@ def human_tier(tier: Tier) -> str:
 
 
 def external_link(url: str, text: str) -> str:
-    """Opens in a new tab — clicking a same-tab link would navigate away
-    from the app and lose the whole conversation's session state."""
-    return f'<a href="{url}" target="_blank" rel="noopener noreferrer">{text}</a>'
+    """Return a Markdown link only for an absolute HTTPS URL."""
+    parsed = urlsplit(url)
+    safe_text = re.sub(r"([\\\[\]`*_])", r"\\\1", str(text))
+    if parsed.scheme != "https" or not parsed.hostname:
+        return f"`{safe_text}`"
+    safe_url = urlunsplit(
+        (parsed.scheme, parsed.netloc, quote(parsed.path, safe="/%"), quote(parsed.query, safe="=&%"), "")
+    )
+    return f"[{safe_text}]({safe_url})"
 
 
 def servicenow_request_url(request_sys_id: str) -> str | None:
@@ -299,7 +299,7 @@ def servicenow_request_url(request_sys_id: str) -> str | None:
 
 def servicenow_link_or_bold(reference: str, request_sys_id: str) -> str:
     url = servicenow_request_url(request_sys_id)
-    return external_link(url, reference) if url else f"<strong>{reference}</strong>"
+    return external_link(url, reference) if url else f"**{reference}**"
 
 
 def servicenow_incident_url(sys_id: str) -> str | None:
@@ -309,20 +309,14 @@ def servicenow_incident_url(sys_id: str) -> str | None:
 
 def servicenow_incident_link_or_bold(number: str, sys_id: str) -> str:
     url = servicenow_incident_url(sys_id)
-    return external_link(url, number) if url else f"<strong>{number}</strong>"
+    return external_link(url, number) if url else f"**{number}**"
 
 
 def render_stat_chips(pairs: list[tuple[str, str]]) -> None:
-    """Renders the colored stat-chip row. Only ever called with system
-    values (cloud names, tiers, durations) — never raw user-typed text —
-    so this is safe to render as HTML."""
-    chips = "".join(
-        f'<div class="stat-chip" style="background-color:{CHIP_COLORS[i % len(CHIP_COLORS)]};">'
-        f'<div class="stat-chip-label">{label}</div>'
-        f'<div class="stat-chip-value">{value}</div></div>'
-        for i, (label, value) in enumerate(pairs)
-    )
-    st.markdown(f'<div class="stat-chip-row">{chips}</div>', unsafe_allow_html=True)
+    """Render untrusted values with native Streamlit components, never HTML."""
+    for column, (label, value) in zip(st.columns(len(pairs)), pairs):
+        column.caption(str(label))
+        column.text(str(value))
 
 
 # ---- conversation state helpers --------------------------------------------------
@@ -599,6 +593,10 @@ def handle_tag_confirm(yes: bool) -> None:
         bot_says("**ℹ️ This resource is already fully tagged.** Nothing more to do.")
         st.session_state.conv_step = "idle_done"
         return
+    except UnsafeIaCOwnershipError as exc:
+        bot_says(f"**This change is blocked by the IaC ownership guard.** {exc}")
+        st.session_state.conv_step = "idle_done"
+        return
     except TagApprovalRequestFailed as exc:
         bot_says(f"**Something went wrong raising this request.** {exc}\n\nPlease try again in a moment.")
         st.session_state.conv_step = "tag_confirm"
@@ -612,7 +610,7 @@ def handle_tag_confirm(yes: bool) -> None:
         "request has been opened yet.** One will only be raised once a human approves this in "
         "ServiceNow, so a declined request never leaves a proposed change sitting on GitHub.\n\n"
         "Use \"Refresh pipeline status\" below to check. I'll open the PR automatically the moment "
-        "it's approved, and offer to merge it for you."
+        "it's approved. An independent reviewer must merge it in GitHub."
     )
     st.session_state.messages.append(tag_result_turn(content, result))
     st.session_state.conv_step = "tag_done"
@@ -767,7 +765,7 @@ def handle_confirm(yes: bool, catalog: EntitlementCatalog) -> None:
         "request has been opened yet.** One will only be raised once a human approves this in "
         "ServiceNow, so a declined request never leaves a proposed change sitting on GitHub.\n\n"
         "Use \"Refresh pipeline status\" below to check. I'll open the PR automatically the moment "
-        "it's approved, and offer to merge it for you."
+        "it's approved. An independent reviewer must merge it in GitHub."
     )
     st.session_state.messages.append(result_turn(content, result))
     st.session_state.conv_step = "done"
@@ -793,7 +791,6 @@ def render_technical_details(result) -> None:
             f"approval sys_id `{result.approval.approval_sys_id}`, state at creation `{result.approval.state}`)\n"
             f"{pr_line}"
             f"- Expires (UTC): `{result.expires_at.isoformat()}`",
-            unsafe_allow_html=True,
         )
         st.code(result.iac_diff, language="hcl")
 
@@ -812,7 +809,7 @@ def render_pipeline_steps(message: dict) -> None:
         lines.append(f"2. {rejected_label}: ServiceNow request {sn_ref}")
         lines.append("3. ⚪ No pull request was raised. A declined request never reaches GitHub")
         lines.append("4. ⚪ Nothing to apply")
-        st.markdown("\n".join(lines), unsafe_allow_html=True)
+        st.markdown("\n".join(lines))
         return
 
     approval_label = APPROVAL_STATE_LABELS.get(approval_state, "⚪ Not checked yet") if approval_state else "⚪ Not checked yet"
@@ -821,7 +818,7 @@ def render_pipeline_steps(message: dict) -> None:
     if result.pull_request is None:
         lines.append("3. ⚪ Not raised yet. Opens automatically once approved")
         lines.append("4. ⚪ Waiting on approval, then PR merge, before the pipeline can apply")
-        st.markdown("\n".join(lines), unsafe_allow_html=True)
+        st.markdown("\n".join(lines))
         return
 
     pr_link = external_link(result.pull_request.html_url, f"PR #{result.pull_request.number}")
@@ -837,15 +834,11 @@ def render_pipeline_steps(message: dict) -> None:
         build_link = external_link(build.log_url, "GitHub Actions run")
         lines.append(f"4. {build_label}: {build_link}")
 
-    st.markdown("\n".join(lines), unsafe_allow_html=True)
+    st.markdown("\n".join(lines))
 
 
 def render_result_turn(message: dict, index: int) -> None:
-    # unsafe_allow_html is scoped to this bot-generated content only (it
-    # embeds a ServiceNow link) — the plain user/bot text turns in
-    # render_turn deliberately never get it, since those can contain raw
-    # user-typed text (email, justification) and must not be interpreted as HTML.
-    st.markdown(message["content"], unsafe_allow_html=True)
+    st.markdown(message["content"])
     result = message["result"]
     render_technical_details(result)
     render_pipeline_steps(message)
@@ -872,20 +865,8 @@ def render_result_turn(message: dict, index: int) -> None:
                 message["last_checked_build"] = build
         st.rerun()
 
-    can_merge = (
-        result.pull_request is not None
-        and message.get("last_checked_approval") == "approved"
-        and message.get("last_checked_pr") != "merged"
-    )
-    if can_merge and cols[1].button("✅ Merge now", key=f"merge_{index}"):
-        with st.spinner("Merging..."):
-            try:
-                merge_access_grant(result.approval, result.pull_request)
-                message["last_checked_pr"] = "merged"
-                st.success("Merged! The GitHub Actions pipeline will apply this shortly.")
-            except MergeNotAllowed as exc:
-                st.error(str(exc))
-        st.rerun()
+    if result.pull_request is not None and message.get("last_checked_approval") == "approved":
+        cols[1].info("Merge in GitHub after required reviews. Aegis cannot merge this PR.")
 
 
 def render_summary_turn(message: dict) -> None:
@@ -922,7 +903,6 @@ def render_tag_technical_details(result) -> None:
             f"(request sys_id `{result.approval.request_sys_id}`, "
             f"approval sys_id `{result.approval.approval_sys_id}`, state at creation `{result.approval.state}`)\n"
             f"{pr_line}",
-            unsafe_allow_html=True,
         )
         st.code(result.iac_diff, language="hcl")
 
@@ -945,7 +925,7 @@ def render_tag_summary_turn(message: dict) -> None:
 
 
 def render_tag_result_turn(message: dict, index: int) -> None:
-    st.markdown(message["content"], unsafe_allow_html=True)
+    st.markdown(message["content"])
     result = message["result"]
     render_tag_technical_details(result)
     render_pipeline_steps(message)
@@ -972,29 +952,14 @@ def render_tag_result_turn(message: dict, index: int) -> None:
                 message["last_checked_build"] = build
         st.rerun()
 
-    can_merge = (
-        result.pull_request is not None
-        and message.get("last_checked_approval") == "approved"
-        and message.get("last_checked_pr") != "merged"
-    )
-    if can_merge and cols[1].button("✅ Merge now", key=f"tag_merge_{index}"):
-        with st.spinner("Merging..."):
-            try:
-                merge_tag_remediation(result.approval, result.pull_request)
-                message["last_checked_pr"] = "merged"
-                st.success("Merged! The GitHub Actions pipeline will apply this shortly.")
-            except TagMergeNotAllowed as exc:
-                st.error(str(exc))
-        st.rerun()
+    if result.pull_request is not None and message.get("last_checked_approval") == "approved":
+        cols[1].info("Merge in GitHub after required reviews. Aegis cannot merge this PR.")
 
 
 def render_incident_result_turn(message: dict, index: int) -> None:
     result = message["result"]
 
-    # Plain markdown throughout: resource_hint/justification are user-typed,
-    # and log messages come from external systems (GCP/Azure) — neither is
-    # trusted enough to render as HTML. Only the incident link below (a
-    # system-generated number + sys_id) gets unsafe_allow_html.
+    # Plain markdown throughout: user input and external logs are untrusted.
     if result.findings:
         st.markdown(f"**{len(result.findings)} log entries found for `{result.resource_hint}` ({result.cloud.value.upper()}):**")
         with st.expander("🔍 Log findings"):
@@ -1007,7 +972,7 @@ def render_incident_result_turn(message: dict, index: int) -> None:
 
     if result.incident:
         ref = servicenow_incident_link_or_bold(result.incident.number, result.incident.sys_id)
-        st.markdown(f"✅ Incident {ref} raised (opens in a new tab).", unsafe_allow_html=True)
+        st.markdown(f"✅ Incident {ref} raised (opens in a new tab).")
         return
 
     if message["declined"]:
@@ -1202,15 +1167,14 @@ def render_step_controls(catalog: EntitlementCatalog) -> str | None:
 
 def main() -> None:
     st.set_page_config(page_title="AEGIS: Agentic Cloud Governance", layout="centered")
-    st.markdown(CARD_UI_CSS, unsafe_allow_html=True)
+    st.html(CARD_UI_CSS)
 
     catalog = load_catalog()
     init_state()
 
-    st.markdown(
+    st.html(
         '<div class="aegis-logo"><span class="badge">⚡</span>'
-        '<h1 style="margin:0;">AEGIS</h1></div>',
-        unsafe_allow_html=True,
+        '<h1 style="margin:0;">AEGIS</h1></div>'
     )
     st.caption(
         "A conversation, not a form. Tell me what you need and I'll check policy, raise the "

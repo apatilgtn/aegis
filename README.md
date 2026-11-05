@@ -52,8 +52,8 @@ There's no form. Every field is a turn in the conversation. The first turn is al
 7. **Confirmation** — a summary rendered as colored stat chips (cloud / business unit / access level / duration) plus the typed reason, with a final yes/no
 8. **Submit** — Aegis runs the policy check and, if it passes, raises a ServiceNow request. **No GitHub PR exists yet at this point.**
 9. **"Refresh pipeline status"** — a button the user can click any time. It polls ServiceNow; if rejected, it says so and stops (nothing was ever proposed on GitHub); if approved, it opens the PR **at that moment**, not before
-10. **"Merge now"** — appears once approved. Clicking it re-checks approval server-side (never trusts a stale UI value) and merges the PR
-11. **GitHub Actions** picks up the merge and runs `terraform apply` for real. The same "Refresh pipeline status" button shows the live build result once merged
+10. **Independent GitHub review** — the application exposes no merge function. A reviewer merges in GitHub after branch-protection requirements pass
+11. **GitHub Actions** picks up that human merge and runs `terraform apply`. The same "Refresh pipeline status" button shows the live build result once merged
 
 The chat only ever writes to ServiceNow and GitHub (proposals and approvals) for this flow; it has no credential capable of writing to Azure or GCP directly.
 
@@ -85,8 +85,8 @@ This flow only ever writes to ServiceNow (the incident record itself); it never 
 6. **Justification** — free text, minimum 10 characters
 7. **Confirmation** — a summary rendered as colored stat chips (cloud / resource / missing tags / cost center) plus the typed reason, with a final yes/no
 8. **Submit** — Aegis runs the policy check and, if it passes, raises a ServiceNow request. **No GitHub PR exists yet at this point.** Only the missing required tags get filled in with a value (owner = requester, cost-center = the typed code, environment = the selected environment); any existing tag is preserved as-is, including ones with the "wrong" value — correcting existing wrong values is out of scope for this capability
-9. **"Refresh pipeline status" / "Merge now"** — identical mechanics to the access-request flow: the PR only opens once ServiceNow approves, and merging re-checks approval server-side before proceeding
-10. **GitHub Actions** picks up the merge and runs `terraform apply` for real (GCP only — see below), creating the bucket if it didn't exist, or updating its labels if it did
+9. **"Refresh pipeline status"** — identical mechanics to the access-request flow; the application never merges the PR
+10. **GCP writes fail closed for now** — Aegis reads bucket labels, but will not render a write until the bucket's existing Terraform state and resource address are registered. It never creates or imports a bucket implicitly
 
 This flow writes to ServiceNow and GitHub exactly like the access-request flow; it has no credential capable of writing to Azure or GCP directly.
 
@@ -94,8 +94,8 @@ This flow writes to ServiceNow and GitHub exactly like the access-request flow; 
 
 | Piece | Status |
 |---|---|
-| ServiceNow approval flow | **Real.** Live PDI instance. Creates a `sc_request` + an explicit `sysapproval_approver` task (a bare Table API insert doesn't trigger ServiceNow's workflow engine — this was a real bug found and fixed) |
-| GitHub PR + merge | **Real.** Opens branches, commits the generated `.tf` file, opens/merges PRs via the GitHub API |
+| ServiceNow approval flow | **Integration ready, Flow setup required.** Uses OAuth client credentials and administrator-owned Flow Designer REST endpoints. Aegis never calls the Table API or stores a ServiceNow username/password |
+| GitHub PR + merge | **PR creation is real.** Opens branches, commits the generated `.tf` file, and opens PRs through a GitHub App. Aegis has no merge API; protected-branch reviewers own the merge |
 | GCP IAM read (current access, `roles/*` lookup) | **Real.** Uses a dedicated read-only service account (`aegis-reader`, `roles/iam.securityReviewer`) |
 | GCP IAM write (`terraform apply`) | **Real.** GitHub Actions authenticates via Workload Identity Federation (no service account key) as `aegis-pipeline` (`roles/resourcemanager.projectIamAdmin`, scoped to one project). Verified end-to-end multiple times, including by the project owner testing with their own Google account |
 | CI/CD pipeline | **Real**, on GitHub Actions (not Cloud Build — deliberately switched so the same workflow shape extends to Azure or any other cloud as another job) |
@@ -103,8 +103,8 @@ This flow writes to ServiceNow and GitHub exactly like the access-request flow; 
 | Natural-language understanding | **Not an LLM call.** The original design envisions an LLM-driven orchestrator; what's built is a deterministic guided conversation (buttons + short free-text fields) that produces the same `AccessGrantRequest`/`IncidentTriageRequest` contract. Swapping in a real LLM means replacing the conversation's input-gathering step, not redesigning anything downstream |
 | Incident triage: GCP log search | **Real.** Live Cloud Logging query via the same read-only `aegis-reader` service account (`roles/logging.viewer`, already granted — no new permission needed) |
 | Incident triage: Azure log search | **Mocked.** No Azure tenant credentials exist in this environment; `mcp_servers/azure_monitor/log_lookup.py` returns canned findings for a couple of known resource hints, same function signature a real Azure Monitor client would have |
-| Incident triage: incident creation | **Real.** Creates an actual `incident` record on the same live ServiceNow PDI, immediately on human confirmation — simpler than the access-grant path since there's no approval task and no downstream pipeline |
-| Tag remediation: GCP tag read + write | **Real.** Reads via `aegis-reader`'s `roles/storage.objectViewer` (bucket metadata comes back from `list_buckets()`, which doesn't need the narrower — and non-project-bindable — `storage.buckets.get` permission); writes via `aegis-pipeline`'s `roles/storage.admin`, scoped to the same one project. The governed resource is a small GCS bucket Aegis fully owns end to end (created by, and only by, this capability), not the shared project — verified end-to-end including a real PR merge and a real `terraform apply` |
+| Incident triage: incident creation | **Integration ready, Flow setup required.** The OAuth-protected incident Flow creates the record after user confirmation |
+| Tag remediation: GCP tag read + write | **Read is real; write is fail-closed.** The legacy bucket-creating resource was removed. Writes remain disabled until an IaC ownership registry routes the proposal to the state that already owns the bucket |
 | Tag remediation: Azure tag read/write | **Mocked.** No Azure tenant credentials exist in this environment; `mcp_servers/azure_resource_tags/resource_tags.py` returns canned tags for one known resource group. A PR can still be opened/merged for an Azure remediation, but (like access_grant's Azure path) there is no Azure job in the CI workflow yet, so `terraform apply` would fail without real credentials — an accepted, pre-existing limitation, not new to this capability |
 | Other capabilities (cost/FinOps) | **Not built.** `access_grant`, `access_check`, `incident_triage`, and `tag_remediation` exist |
 
@@ -118,10 +118,10 @@ contracts/            Pydantic models — the cloud-neutral capability boundary
 
 agents/               Capability agents (business logic, no I/O of its own)
   guardrail_agent.py       Calls the Rego policy, returns a PolicyDecision
-  access_grant_agent.py    handle_access_grant, advance_pipeline, merge_access_grant, status checks
+  access_grant_agent.py    handle_access_grant, advance_pipeline, read-only status checks; never merges
   access_check_agent.py    "What access do I currently have" — read-only
   incident_triage_agent.py triage_incident, raise_incident — no policy gate, no PR pipeline
-  tag_remediation_agent.py check_tag_compliance, handle_tag_remediation, advance_pipeline, merge — same shape as access_grant
+  tag_remediation_agent.py check_tag_compliance, handle_tag_remediation, advance_pipeline; never merges
   terraform_render.py      Renders the HCL diff for a resolved entitlement
   tag_render.py            Renders the HCL diff for a tag remediation
 
@@ -132,24 +132,22 @@ mcp_servers/          One subfolder per external system, real client + FastMCP t
   azure_monitor/           Mocked log lookups (no real tenant)
   gcp_storage/             Real GCS bucket label lookups (tag remediation)
   azure_resource_tags/     Mocked resource tag lookups (no real tenant)
-  servicenow/              Real ServiceNow client (access requests + incidents)
-  github/                  Real GitHub client (branch/commit/PR/merge/status) — shared by every capability
+  servicenow/              OAuth + Flow client (access requests, status, incidents; no Table API)
+  github/                  GitHub App client (branch/commit/PR/read-only status; no merge) — shared by every capability
 
 policy/               OPA/Rego guardrail policies + tests (access_grant, tag_remediation)
 data/                 entitlement_catalog.yaml, tag_policy.yaml — the source of truth for what's grantable/required
 modules/              Reusable Terraform modules (Entra group membership, GCP IAM binding, tagged bucket, Azure resource tags)
 infra/access-grants/     Terraform root module for access grants — generated .tf files land here
 infra/tag-remediations/  Terraform root module for tag remediations — generated .tf files land here
-.github/workflows/    terraform-apply.yml — GitHub Actions, GCP via Workload Identity Federation, one job per root module
+.github/workflows/    portal/platform CI plus protected Terraform apply after merge
 ui/                   chat_app.py — the Streamlit conversational front-end
 ```
 
 ## Running it locally
 
 ```bash
-pip install streamlit pydantic pyyaml regopy requests python-dotenv \
-  google-auth google-api-python-client google-cloud-resource-manager \
-  google-cloud-storage google-cloud-iam mcp
+python -m pip install --requirement requirements.lock
 
 cp .env.example .env   # fill in ServiceNow + GitHub + GCP project details
 streamlit run ui/chat_app.py
@@ -163,11 +161,11 @@ Secrets live in `.env` (gitignored) and, for GCP, a service account key under `.
 python3 -m pytest -q
 ```
 
-54 tests across contracts, the entitlement/tag policies, both guardrail policies (evaluated for real against the actual `.rego` files via `regopy`, not mocked), and all four capability agents. External calls (ServiceNow, GitHub) are stubbed in the automated suite so running tests never creates real tickets, incidents, or PRs — the real integrations are verified separately via live scripted runs, several of which resulted in genuine, confirmed GCP IAM grants, ServiceNow incidents, and a real merged PR that a subsequent `terraform apply` picked up.
+71 tests cover contracts, policies, render escaping, OAuth/Flow boundaries, and capability agents. External calls are stubbed, so tests never create tickets, incidents, or PRs.
 
 ## Security notes
 
 - **Least privilege by construction**: `aegis-reader` can only read (IAM policies, logs, and now GCS bucket metadata); `aegis-pipeline` can only touch IAM bindings and GCS buckets on one project, and only ever runs inside GitHub Actions, never invoked directly by the chat. Each new capability that needed a new permission got its own narrowly scoped role grant, not a broadening of an existing one.
 - **No standing cloud credentials in CI**: the pipeline authenticates via Workload Identity Federation, not a stored key.
 - **PR creation is gated on approval, not parallel to it**: a declined ServiceNow request never produces a GitHub PR (an earlier version of this app got this wrong; fixed and verified).
-- **Secrets**: `.env` and `.secrets/` are gitignored. A temporary Owner-scoped bootstrap service account (`aegis-bootstrap`) was used to provision the two scoped service accounts and has not yet been revoked — that's the one cleanup item still outstanding.
+- **Secrets**: `.env` and `.secrets/` are gitignored. The temporary Owner-scoped bootstrap service account (`aegis-bootstrap`) has been removed from project IAM and its user-managed key has been deleted. Runtime reads use the scoped reader identity; governed delivery uses the GitHub workload-identity path.

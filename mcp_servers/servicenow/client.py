@@ -1,28 +1,15 @@
-"""
-Real ServiceNow client — Layer 4 of the Aegis architecture (the governed
-change path). Unlike the Layer 3 tool servers (azure_entra, gcp_resource_manager)
-which are strictly read-only, this one legitimately writes — but only ever
-creates the approval ask itself (a Service Catalog Request + an explicit
-approval task). It never touches cloud infrastructure; that only happens
-after a human approves and CI/CD runs `terraform apply`.
+"""ServiceNow OAuth client for governed, Flow-owned integration endpoints.
 
-Object model: a bare Table API insert into sc_request does NOT trigger
-ServiceNow's workflow engine (verified empirically — the request sits at
-approval="not requested" with no task in anyone's approval queue). To get a
-real, actionable approval, we explicitly create a sysapproval_approver
-record tied to the request. That record's own `state` field is the reliable
-source of truth for status — the parent request's `approval` rollup field
-was observed to report stale/incorrect values on this instance, so callers
-must poll the approval task, not the request.
-
-Credentials are read from environment variables (see .env.example), loaded
-via python-dotenv — never hardcoded, never logged.
+Aegis never writes ServiceNow tables directly. Each operation calls an
+administrator-owned Flow Designer REST endpoint with a short-lived OAuth
+client-credentials token. The Flow owns record creation, approval routing,
+ACL enforcement, validation, and response shaping.
 """
 
 from __future__ import annotations
 
 import os
-from functools import lru_cache
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -31,7 +18,15 @@ from pydantic import BaseModel
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-_REQUIRED_ENV_VARS = ("SN_INSTANCE_URL", "SN_USERNAME", "SN_PASSWORD")
+_REQUIRED_ENV_VARS = (
+    "SN_INSTANCE_URL",
+    "SN_OAUTH_CLIENT_ID",
+    "SN_OAUTH_CLIENT_SECRET",
+    "SN_ACCESS_FLOW_PATH",
+    "SN_STATUS_FLOW_PATH",
+    "SN_INCIDENT_FLOW_PATH",
+)
+_token_cache: tuple[str, datetime] | None = None
 
 
 class ServiceNowConfigError(Exception):
@@ -56,101 +51,116 @@ class IncidentRecordRef(BaseModel):
     sys_id: str
 
 
-def _config() -> tuple[str, str, str]:
+def _config() -> dict[str, str]:
     missing = [name for name in _REQUIRED_ENV_VARS if not os.getenv(name)]
     if missing:
         raise ServiceNowConfigError(f"missing required environment variables: {', '.join(missing)}")
-    return os.environ["SN_INSTANCE_URL"], os.environ["SN_USERNAME"], os.environ["SN_PASSWORD"]
+    instance_url = os.environ["SN_INSTANCE_URL"].rstrip("/")
+    if not instance_url.startswith("https://"):
+        raise ServiceNowConfigError("SN_INSTANCE_URL must use https")
+    for name in ("SN_ACCESS_FLOW_PATH", "SN_STATUS_FLOW_PATH", "SN_INCIDENT_FLOW_PATH"):
+        if not os.environ[name].startswith("/") or "://" in os.environ[name]:
+            raise ServiceNowConfigError(f"{name} must be a relative path beginning with '/'")
+    return {
+        "instance_url": instance_url,
+        "client_id": os.environ["SN_OAUTH_CLIENT_ID"],
+        "client_secret": os.environ["SN_OAUTH_CLIENT_SECRET"],
+        "access_path": os.environ["SN_ACCESS_FLOW_PATH"],
+        "status_path": os.environ["SN_STATUS_FLOW_PATH"],
+        "incident_path": os.environ["SN_INCIDENT_FLOW_PATH"],
+    }
 
 
-def _get(path: str, params: dict) -> dict:
-    instance_url, username, password = _config()
-    response = requests.get(
-        f"{instance_url}/api/now/table/{path}",
-        auth=(username, password),
-        headers={"Accept": "application/json"},
-        params=params,
+def _access_token(config: dict[str, str]) -> str:
+    global _token_cache
+    now = datetime.now(timezone.utc)
+    if _token_cache and _token_cache[1] > now + timedelta(seconds=60):
+        return _token_cache[0]
+
+    response = requests.post(
+        f"{config['instance_url']}/oauth_token.do",
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "client_credentials",
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+        },
         timeout=15,
     )
     if response.status_code != 200:
         raise ServiceNowRequestError(response.status_code, response.text)
-    return response.json()["result"]
+    payload = response.json()
+    token = payload.get("access_token")
+    if not token:
+        raise ServiceNowRequestError(502, "OAuth response did not contain access_token")
+    expires_in = max(int(payload.get("expires_in", 300)), 60)
+    _token_cache = (token, now + timedelta(seconds=expires_in))
+    return token
 
 
-def _post(path: str, body: dict) -> dict:
-    instance_url, username, password = _config()
+def _invoke_flow(path_key: str, body: dict) -> dict:
+    config = _config()
     response = requests.post(
-        f"{instance_url}/api/now/table/{path}",
-        auth=(username, password),
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        f"{config['instance_url']}{config[path_key]}",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {_access_token(config)}",
+        },
         json=body,
-        timeout=15,
+        timeout=30,
     )
-    if response.status_code not in (200, 201):
+    if response.status_code not in (200, 201, 202):
         raise ServiceNowRequestError(response.status_code, response.text)
-    return response.json()["result"]
+    payload = response.json()
+    result = payload.get("result", payload)
+    if not isinstance(result, dict):
+        raise ServiceNowRequestError(502, "Flow response must contain a JSON object")
+    return result
 
 
-@lru_cache(maxsize=8)
-def _resolve_approver_sys_id(username: str) -> str:
-    results = _get("sys_user", {"sysparm_query": f"user_name={username}", "sysparm_fields": "sys_id", "sysparm_limit": 1})
-    if not results:
-        raise ServiceNowConfigError(f"no ServiceNow user found for SN_APPROVER_USERNAME={username!r}")
-    return results[0]["sys_id"]
+def _required(result: dict, *keys: str) -> tuple[str, ...]:
+    missing = [key for key in keys if not isinstance(result.get(key), str) or not result[key]]
+    if missing:
+        raise ServiceNowRequestError(502, f"Flow response missing fields: {', '.join(missing)}")
+    return tuple(result[key] for key in keys)
 
 
 def create_access_request(short_description: str, description: str, justification: str) -> AccessRequestRef:
-    """Raises the ServiceNow approval ask for a proposed access grant: a
-    Service Catalog Request plus an explicit approval task, so a real human
-    has something to act on in their ServiceNow approval queue.
-    """
-    approver_username = os.getenv("SN_APPROVER_USERNAME", "admin")
-    approver_sys_id = _resolve_approver_sys_id(approver_username)
-
-    request = _post(
-        "sc_request",
-        {"short_description": short_description, "description": f"{description}\n\nJustification: {justification}"},
-    )
-
-    approval_task = _post(
-        "sysapproval_approver",
+    """Ask the configured access-request Flow to create and route approval."""
+    result = _invoke_flow(
+        "access_path",
         {
-            "sysapproval": request["sys_id"],
-            "approver": approver_sys_id,
-            "state": "requested",
             "short_description": short_description,
+            "description": description,
+            "justification": justification,
         },
     )
-
+    request_number, request_sys_id, approval_sys_id, approval_state = _required(
+        result, "request_number", "request_sys_id", "approval_sys_id", "approval_state"
+    )
     return AccessRequestRef(
-        request_number=request["number"],
-        request_sys_id=request["sys_id"],
-        approval_sys_id=approval_task["sys_id"],
-        approval_state=approval_task["state"],
+        request_number=request_number,
+        request_sys_id=request_sys_id,
+        approval_sys_id=approval_sys_id,
+        approval_state=approval_state,
     )
 
 
 def create_incident(short_description: str, description: str, urgency: str = "3") -> IncidentRecordRef:
-    """Raises a ServiceNow incident directly — unlike create_access_request,
-    there is no approval task to create, because raising the incident IS the
-    action (investigating/tracking an issue), not a request for permission
-    to change something. urgency follows ServiceNow's native scale:
-    "1" (high) .. "3" (low).
-    """
-    result = _post(
-        "incident",
+    """Ask the configured incident Flow to create a governed incident."""
+    result = _invoke_flow(
+        "incident_path",
         {"short_description": short_description, "description": description, "urgency": urgency},
     )
-    return IncidentRecordRef(number=result["number"], sys_id=result["sys_id"])
+    number, sys_id = _required(result, "number", "sys_id")
+    return IncidentRecordRef(number=number, sys_id=sys_id)
 
 
 def get_approval_state(approval_sys_id: str) -> str:
-    """Read-only status check against the approval task itself (not the
-    request's rollup field — see module docstring for why that's unreliable).
-    Returns one of ServiceNow's native values: requested, approved,
-    rejected, cancelled, not requested.
-    """
-    result = _get("sysapproval_approver", {"sysparm_query": f"sys_id={approval_sys_id}", "sysparm_fields": "state", "sysparm_limit": 1})
-    if not result:
-        raise ServiceNowRequestError(404, f"no approval task found for sys_id={approval_sys_id}")
-    return result[0]["state"]
+    """Ask the status Flow for the current approval state."""
+    result = _invoke_flow("status_path", {"approval_sys_id": approval_sys_id})
+    (state,) = _required(result, "state")
+    if state not in {"requested", "approved", "rejected", "cancelled", "not requested"}:
+        raise ServiceNowRequestError(502, f"Flow returned unsupported approval state: {state!r}")
+    return state

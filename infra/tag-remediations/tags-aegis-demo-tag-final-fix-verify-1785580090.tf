@@ -7,9 +7,9 @@ module "tags-aegis-demo-tag-final-fix-verify" {
   source      = "../../modules/gcp/tagged_bucket"
   bucket_name = "aegis-demo-tag-final-fix-verify"
   project     = "ual-demo-af168"
-  labels      = {
+  labels = {
     "cost-center" = "pmt-01"
     "environment" = "nonprod"
-    "owner" = "jane-doe-example-com"
+    "owner"       = "jane-doe-example-com"
   }
 }

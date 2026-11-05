@@ -11,8 +11,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp_servers.servicenow.client import (
     ServiceNowConfigError,
     ServiceNowRequestError,
-    create_change_request,
-    get_change_request_state,
+    create_access_request,
+    get_approval_state,
 )
 
 mcp = FastMCP("aegis-servicenow")
@@ -22,7 +22,7 @@ mcp = FastMCP("aegis-servicenow")
 def raise_change_request(short_description: str, description: str, justification: str) -> dict:
     """Raise a ServiceNow change request as the approval ask for a proposed access grant."""
     try:
-        ref = create_change_request(short_description, description, justification)
+        ref = create_access_request(short_description, description, justification)
     except (ServiceNowConfigError, ServiceNowRequestError) as exc:
         raise ValueError(str(exc)) from exc
     return ref.model_dump()
@@ -32,7 +32,7 @@ def raise_change_request(short_description: str, description: str, justification
 def check_change_request_state(sys_id: str) -> str:
     """Check whether a previously raised change request is still pending, approved, or rejected."""
     try:
-        return get_change_request_state(sys_id)
+        return get_approval_state(sys_id)
     except (ServiceNowConfigError, ServiceNowRequestError) as exc:
         raise ValueError(str(exc)) from exc
 

@@ -1,22 +1,23 @@
 """
-Real, read-only log search backing the incident_triage capability. Uses the
-same aegis-reader service account as the other GCP read lookups (already
-has roles/logging.viewer — no new grant needed). Never writes; raising the
-actual incident is a separate, explicit action (see mcp_servers/servicenow).
+Real, read-only log search backing the incident_triage capability. Uses
+Application Default Credentials so local development, workload identity, and
+attached runtime identities work without a static key. Never writes; raising
+the actual incident is a separate, explicit action (see mcp_servers/servicenow).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+import json
+import os
 
+import google.auth
+from google.auth.exceptions import DefaultCredentialsError
 from google.cloud import logging_v2
-from google.oauth2 import service_account
 
 from contracts.capability_contract import LogFinding
 
-_PROJECT_ID = "ual-demo-af168"
-_KEY_PATH = Path(__file__).resolve().parents[2] / ".secrets" / "aegis-reader-key.json"
+_PROJECT_ID = os.getenv("GCP_PROJECT_PAYMENTS_NONPROD", "ual-demo-af168")
 
 # Standard Cloud Logging severity values (LogSeverity enum) — hardcoded
 # because the generated client returns a bare int, not an enum wrapper.
@@ -31,6 +32,7 @@ _SEVERITY_NAMES = {
     700: "ALERT",
     800: "EMERGENCY",
 }
+_ALLOWED_SEVERITIES = frozenset(_SEVERITY_NAMES.values())
 
 
 class GcpLoggingConfigError(Exception):
@@ -38,21 +40,44 @@ class GcpLoggingConfigError(Exception):
 
 
 def _client() -> logging_v2.services.logging_service_v2.LoggingServiceV2Client:
-    if not _KEY_PATH.exists():
-        raise GcpLoggingConfigError(f"no credentials file at {_KEY_PATH}")
-    credentials = service_account.Credentials.from_service_account_file(str(_KEY_PATH))
+    try:
+        credentials, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform.read-only"]
+        )
+    except DefaultCredentialsError as exc:
+        raise GcpLoggingConfigError("GCP Application Default Credentials are unavailable") from exc
     return logging_v2.services.logging_service_v2.LoggingServiceV2Client(credentials=credentials)
 
 
 def search_logs(resource_hint: str, time_window_hours: int, min_severity: str = "WARNING") -> list[LogFinding]:
+    resource_hint = resource_hint.strip()
+    if (
+        not resource_hint
+        or len(resource_hint) > 255
+        or any(ord(char) < 32 for char in resource_hint)
+    ):
+        raise ValueError("resource_hint must contain 1-255 printable characters")
+    if (
+        not isinstance(time_window_hours, int)
+        or isinstance(time_window_hours, bool)
+        or not 1 <= time_window_hours <= 168
+    ):
+        raise ValueError("time_window_hours must be an integer between 1 and 168")
+    min_severity = min_severity.upper()
+    if min_severity not in _ALLOWED_SEVERITIES:
+        raise ValueError("min_severity is not a supported Cloud Logging severity")
+
     client = _client()
     since = datetime.now(timezone.utc) - timedelta(hours=time_window_hours)
+    # Cloud Logging string literals use JSON-compatible escaping. Encoding once
+    # prevents a hint from terminating the literal and adding filter clauses.
+    hint_literal = json.dumps(resource_hint)
 
     filter_str = (
         f'timestamp >= "{since.isoformat()}" '
         f"AND severity >= {min_severity} "
-        f'AND (textPayload:"{resource_hint}" OR jsonPayload.message:"{resource_hint}" '
-        f'OR resource.labels.service_name:"{resource_hint}" OR labels.build_trigger_name:"{resource_hint}")'
+        f"AND (textPayload:{hint_literal} OR jsonPayload.message:{hint_literal} "
+        f"OR resource.labels.service_name:{hint_literal} OR labels.build_trigger_name:{hint_literal})"
     )
 
     entries = client.list_log_entries(

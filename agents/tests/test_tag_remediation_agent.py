@@ -3,16 +3,15 @@ import pytest
 from agents.tag_remediation_agent import (
     AlreadyCompliantError,
     ApprovalRejected,
-    MergeNotAllowed,
     TagRemediationDenied,
     _gcp_label_safe,
     advance_pipeline,
     check_approval_status,
     check_pull_request_status,
     handle_tag_remediation,
-    merge_tag_remediation,
 )
-from contracts.capability_contract import Cloud, Environment, PullRequestRef, TagComplianceRequest
+from agents.tag_render import UnsafeIaCOwnershipError, render_tag_remediation_diff
+from contracts.capability_contract import Cloud, Environment, PullRequestRef, TagComplianceRequest, TagRef
 from mcp_servers.servicenow.client import AccessRequestRef
 
 FAKE_PR = PullRequestRef(number=8888, html_url="https://github.com/example/repo/pull/8888", branch="fake-branch")
@@ -91,20 +90,12 @@ def test_gcp_label_safe_sanitizes_to_a_valid_label(value, expected):
     assert _gcp_label_safe(value) == expected
 
 
-def test_under_tagged_gcp_resource_produces_diff_with_no_pr_yet(under_tagged_gcp_request):
-    result = handle_tag_remediation(under_tagged_gcp_request)
+def test_under_tagged_gcp_resource_fails_closed_without_registered_iac_owner(under_tagged_gcp_request):
+    with pytest.raises(UnsafeIaCOwnershipError) as exc_info:
+        handle_tag_remediation(under_tagged_gcp_request)
 
-    assert result.policy_decision.allowed is True
-    assert result.pull_request is None  # not raised until approved
-    assert set(result.missing_keys) == {"owner", "cost-center", "environment"}
-    assert 'source      = "../../modules/gcp/tagged_bucket"' in result.iac_diff
-    assert "aegis-demo-payments-bucket" in result.iac_diff
-    # GCP label values must be lowercase letters/digits/hyphens/underscores
-    # only — the agent sanitizes free-text values (email, cost-center) to
-    # fit, rather than letting `terraform apply` fail on them later.
-    assert '"owner" = "jane-doe-example-com"' in result.iac_diff
-    assert '"cost-center" = "pmt-01"' in result.iac_diff
-    assert '"environment" = "nonprod"' in result.iac_diff
+    assert "owning Terraform state" in str(exc_info.value)
+    assert "implicitly" in str(exc_info.value)
 
 
 def test_partially_tagged_azure_resource_only_fills_the_gap(partially_tagged_azure_request):
@@ -114,7 +105,7 @@ def test_partially_tagged_azure_resource_only_fills_the_gap(partially_tagged_azu
     proposed = {tag.key: tag.value for tag in result.proposed_tags}
     assert proposed["owner"] == "someone@example.com"  # preserved, not overwritten
     assert proposed["cost-center"] == "PMT-01"
-    assert 'source               = "../../modules/azure/resource_tags"' in result.iac_diff
+    assert 'source              = "../../modules/azure/resource_tags"' in result.iac_diff
 
 
 def test_fully_compliant_resource_raises_and_produces_no_diff(monkeypatch):
@@ -144,8 +135,8 @@ def test_guardrail_denial_is_surfaced_as_tag_remediation_denied(under_tagged_gcp
     assert "not remediated" in str(exc_info.value)
 
 
-def test_advance_pipeline_does_not_raise_pr_while_pending(under_tagged_gcp_request, monkeypatch):
-    result = handle_tag_remediation(under_tagged_gcp_request)
+def test_advance_pipeline_does_not_raise_pr_while_pending(partially_tagged_azure_request, monkeypatch):
+    result = handle_tag_remediation(partially_tagged_azure_request)
     monkeypatch.setattr("agents.tag_remediation_agent.get_approval_state", lambda approval_sys_id: "requested")
 
     advanced = advance_pipeline(result)
@@ -153,8 +144,8 @@ def test_advance_pipeline_does_not_raise_pr_while_pending(under_tagged_gcp_reque
     assert advanced.pull_request is None
 
 
-def test_advance_pipeline_raises_pr_once_approved(under_tagged_gcp_request, monkeypatch):
-    result = handle_tag_remediation(under_tagged_gcp_request)
+def test_advance_pipeline_raises_pr_once_approved(partially_tagged_azure_request, monkeypatch):
+    result = handle_tag_remediation(partially_tagged_azure_request)
     approve(monkeypatch)
 
     advanced = advance_pipeline(result)
@@ -162,16 +153,16 @@ def test_advance_pipeline_raises_pr_once_approved(under_tagged_gcp_request, monk
     assert advanced.pull_request == FAKE_PR
 
 
-def test_advance_pipeline_never_raises_pr_when_rejected(under_tagged_gcp_request, monkeypatch):
-    result = handle_tag_remediation(under_tagged_gcp_request)
+def test_advance_pipeline_never_raises_pr_when_rejected(partially_tagged_azure_request, monkeypatch):
+    result = handle_tag_remediation(partially_tagged_azure_request)
     monkeypatch.setattr("agents.tag_remediation_agent.get_approval_state", lambda approval_sys_id: "rejected")
 
     with pytest.raises(ApprovalRejected):
         advance_pipeline(result)
 
 
-def test_advance_pipeline_is_a_noop_once_pr_already_exists(under_tagged_gcp_request, monkeypatch):
-    result = handle_tag_remediation(under_tagged_gcp_request)
+def test_advance_pipeline_is_a_noop_once_pr_already_exists(partially_tagged_azure_request, monkeypatch):
+    result = handle_tag_remediation(partially_tagged_azure_request)
     approve(monkeypatch)
     first = advance_pipeline(result)
 
@@ -185,8 +176,8 @@ def test_advance_pipeline_is_a_noop_once_pr_already_exists(under_tagged_gcp_requ
     assert second.pull_request == FAKE_PR
 
 
-def test_check_pull_request_status_polls_the_pr_number(under_tagged_gcp_request, monkeypatch):
-    result = handle_tag_remediation(under_tagged_gcp_request)
+def test_check_pull_request_status_polls_the_pr_number(partially_tagged_azure_request, monkeypatch):
+    result = handle_tag_remediation(partially_tagged_azure_request)
     approve(monkeypatch)
     result = advance_pipeline(result)
 
@@ -198,25 +189,20 @@ def test_check_pull_request_status_polls_the_pr_number(under_tagged_gcp_request,
     assert check_pull_request_status(result.pull_request) == "merged"
 
 
-def test_merge_tag_remediation_refuses_when_not_approved(under_tagged_gcp_request, monkeypatch):
-    result = handle_tag_remediation(under_tagged_gcp_request)
-    approve(monkeypatch)
-    result = advance_pipeline(result)
+def test_tag_agent_exposes_no_merge_capability():
+    import agents.tag_remediation_agent as agent
+    import mcp_servers.github.client as github
 
-    monkeypatch.setattr("agents.tag_remediation_agent.get_approval_state", lambda approval_sys_id: "requested")
-
-    with pytest.raises(MergeNotAllowed):
-        merge_tag_remediation(result.approval, result.pull_request)
+    assert not hasattr(agent, "merge_tag_remediation")
+    assert not hasattr(github, "merge_pull_request")
 
 
-def test_merge_tag_remediation_merges_when_approved(under_tagged_gcp_request, monkeypatch):
-    result = handle_tag_remediation(under_tagged_gcp_request)
-    approve(monkeypatch)
-    result = advance_pipeline(result)
-
-    monkeypatch.setattr(
-        "agents.tag_remediation_agent.merge_pull_request",
-        lambda pr_number: "abc123sha" if pr_number == 8888 else "wrong-pr-used",
+def test_tag_hcl_escapes_resource_names_keys_and_values(partially_tagged_azure_request):
+    request = partially_tagged_azure_request.model_copy(update={"resource_id": 'rg"\nresource "x" "y" {}'})
+    rendered = render_tag_remediation_diff(
+        request,
+        [TagRef(key='owner"\nkey', value='value"\nresource "x" "z" {}')],
     )
 
-    assert merge_tag_remediation(result.approval, result.pull_request) == "abc123sha"
+    assert '\\nresource \\"x\\"' in rendered
+    assert '\nresource "x"' not in rendered

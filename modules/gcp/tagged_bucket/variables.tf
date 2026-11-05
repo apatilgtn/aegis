@@ -5,16 +5,16 @@ variable "bucket_name" {
 
 variable "project" {
   type        = string
-  description = "GCP project ID the bucket is created in"
+  description = "Retained for compatibility; this module never creates a bucket"
 }
 
 variable "location" {
   type        = string
   default     = "us-central1"
-  description = "GCS bucket location"
+  description = "Retained for compatibility; this module never creates a bucket"
 }
 
 variable "labels" {
   type        = map(string)
-  description = "Full desired label set, resolved by the tag_remediation capability agent"
+  description = "Must be empty; changes require a registered owning Terraform state"
 }

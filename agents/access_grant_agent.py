@@ -36,7 +36,6 @@ from mcp_servers.github.client import (
     get_merge_commit_sha,
     get_pull_request_state,
     get_workflow_run_for_commit,
-    merge_pull_request,
     open_pull_request,
 )
 from mcp_servers.servicenow.client import (
@@ -201,18 +200,3 @@ def check_pipeline_status(pull_request: PullRequestRef) -> tuple[str, WorkflowRu
     run = get_workflow_run_for_commit(commit_sha) if commit_sha else None
     return pr_state, run
 
-
-class MergeNotAllowed(Exception):
-    def __init__(self, approval_state: str):
-        super().__init__(f"refusing to merge — ServiceNow approval state is {approval_state!r}, not 'approved'")
-
-
-def merge_access_grant(approval: ApprovalRef, pull_request: PullRequestRef) -> str:
-    """The one explicit human-triggered write in this whole flow: merging the
-    PR, which is what actually lets the CI/CD pipeline apply the change.
-    Re-checks the live approval state itself rather than trusting a stale
-    value the caller might be holding — never merges an unapproved request."""
-    approval_state = check_approval_status(approval)
-    if approval_state != "approved":
-        raise MergeNotAllowed(approval_state)
-    return merge_pull_request(pull_request.number)
