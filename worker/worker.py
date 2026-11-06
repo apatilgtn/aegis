@@ -13,6 +13,8 @@ import logging
 import os
 import re
 import socket
+from pathlib import Path
+import sys
 import threading
 import time
 import urllib.error
@@ -26,10 +28,12 @@ from typing import Any
 import jwt
 
 try:  # imported as a package (tests)
-    from . import gcp, servicenow
+    from . import gcp, servicenow, governance, plan_gate
 except ImportError:  # run as /app/worker.py
     import gcp  # type: ignore[no-redef]
     import servicenow  # type: ignore[no-redef]
+    import governance  # type: ignore[no-redef]
+    import plan_gate  # type: ignore[no-redef]
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -150,6 +154,25 @@ POLICY_PATHS = {
 }
 
 
+def governance_context(action_request: dict[str, Any]) -> tuple[dict, dict, dict, dict | None]:
+    tenant = str(action_request["tenant_id"])
+    account = cloud_account(tenant)
+    settings = select("governance_settings", f"tenant_id=eq.{tenant}&limit=1")
+    policies = select("capability_policies", f"tenant_id=eq.{tenant}&capability=eq.{urllib.parse.quote(str(action_request['capability']), safe='')}&limit=1")
+    if len(settings) != 1 or len(policies) != 1:
+        raise NonRetryableJobError("Governance controls have not been configured")
+    route = None
+    if action_request["capability"] == "access_grant":
+        resource = action_request.get("resource") or {}
+        routes = select("service_entitlements", f"tenant_id=eq.{tenant}&service_id=eq.{action_request['service_id']}&cloud=eq.gcp&environment=eq.{urllib.parse.quote(str(resource.get('environment')), safe='')}&tier=eq.{urllib.parse.quote(str(resource.get('tier')), safe='')}&enabled=eq.true&limit=2")
+        if len(routes) == 1:
+            route = routes[0]
+    if route and route.get("scope_type") == "bucket":
+        if not any(item["name"] == route.get("scope_identifier") for item in gcp.list_buckets(account["project_id"])):
+            raise NonRetryableJobError("Reviewed bucket scope is outside the governed project")
+    return account, settings[0], policies[0], route
+
+
 def policy_input(action_request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return (OPA input, extra facts to keep with the decision)."""
     capability = action_request.get("capability")
@@ -164,6 +187,10 @@ def policy_input(action_request: dict[str, Any]) -> tuple[dict[str, Any], dict[s
     if capability == "label_fix":
         # The live labels decide what gets proposed; the portal's view may be stale.
         bucket = str(resource.get("bucket") or "")
+        project = cloud_account(str(action_request["tenant_id"]))["project_id"]
+        owned = next((item for item in gcp.list_buckets(project) if item["name"] == bucket), None)
+        if owned is None:
+            raise NonRetryableJobError("The bucket does not belong to the governed project")
         current = gcp.bucket_labels(bucket)
         missing = gcp.missing_labels(current)
         return {"cloud": resource.get("cloud"), "environment": resource.get("environment"), "bucket": bucket,
@@ -172,12 +199,29 @@ def policy_input(action_request: dict[str, Any]) -> tuple[dict[str, Any], dict[s
     raise NonRetryableJobError(f"Unsupported capability: {capability}")
 
 
+def policy_bundle_digest() -> str:
+    directory = Path("/policies") if Path("/policies").is_dir() else Path(__file__).resolve().parents[1] / "policy"
+    policies = {p.name: p.read_text() for p in sorted(directory.glob("*.rego")) if not p.name.endswith("_test.rego")}
+    if not policies:
+        raise ConfigurationError("No deployed policy bundle is available")
+    return governance.digest(policies)
+
+
 def evaluate_policy(action_request: dict[str, Any]) -> dict[str, Any]:
     capability = str(action_request.get("capability"))
     path = POLICY_PATHS.get(capability)
     if path is None:
         raise NonRetryableJobError(f"Unsupported capability: {capability}")
+    account, settings, policy, route = governance_context(action_request)
+    denials = governance.control_denials(action_request, account, settings, policy, route)
+    if denials:
+        return {"allowed": False, "reasons": denials, "risk_level": "critical" if account["environment"] == "prod" else "unknown", "policy_ids": ["AEGIS-CAPABILITY-001"]}
     request_input, facts = policy_input(action_request)
+    request_input.update({"production_authorized": policy["production_allowed"] and settings["writes_enabled"], "production_max_ttl": policy["max_ttl_hours"]})
+    facts["governance_revision"] = settings["revision"]
+    facts["policy_bundle_sha256"] = policy_bundle_digest()
+    if route:
+        facts["reviewed_scope"] = {"project": account["project_id"], "environment": account["environment"], "role": route["role_identifier"], "type": route.get("scope_type", "project"), "resource": route.get("scope_identifier") or account["project_id"]}
     response = request_json(f"{OPA_URL}/v1/data/{path}/decision", method="POST", body={"input": {"request": request_input}})
     decision = response.get("result") if isinstance(response, dict) else None
     if not isinstance(decision, dict) or not isinstance(decision.get("allowed"), bool):
@@ -189,6 +233,9 @@ def evaluate_policy(action_request: dict[str, Any]) -> dict[str, Any]:
 def handle_policy_evaluation(job: dict[str, Any]) -> None:
     action_request = load_request(job)
     decision = evaluate_policy(action_request)
+    if decision["allowed"] and action_request.get("capability") == "access_grant":
+        hours = action_request["resource"]["ttl_hours"]
+        decision["proposed_expires_at"] = (datetime.now(timezone.utc) + timedelta(hours=hours)).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     rpc("complete_policy_evaluation", {
         "p_job_id": job["id"],
         "p_worker_id": WORKER_ID,
@@ -282,8 +329,8 @@ def load_proposal_context_for(action_request: dict[str, Any]) -> tuple[dict[str,
     routes = select(
         "service_entitlements",
         "select=id,cloud,environment,tier,entitlement_type,target_identifier,role_identifier,"
-        "terraform_module_source,max_ttl_hours"
-        f"&service_id=eq.{action_request['service_id']}"
+        "terraform_module_source,max_ttl_hours,scope_type,scope_identifier"
+        f"&service_id=eq.{action_request['service_id']}&tenant_id=eq.{action_request['tenant_id']}"
         f"&cloud=eq.{urllib.parse.quote(str(resource['cloud']), safe='')}"
         f"&environment=eq.{urllib.parse.quote(str(resource['environment']), safe='')}"
         f"&tier=eq.{urllib.parse.quote(str(resource['tier']), safe='')}&enabled=eq.true&limit=2",
@@ -302,6 +349,12 @@ BASIC_GCP_ROLES = {"roles/owner", "roles/editor", "roles/viewer"}
 
 def access_expires_at(action_request: dict[str, Any]) -> str:
     """Expiry = approval time + requested duration, so re-rendering is deterministic."""
+    fixed = (action_request.get("policy_decision") or {}).get("proposed_expires_at")
+    if fixed:
+        value = datetime.fromisoformat(str(fixed).replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            raise NonRetryableJobError("Proposed expiry has no timezone")
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     decided_at = str(action_request.get("decided_at") or "")
     try:
         approved = datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
@@ -328,7 +381,11 @@ def render_gcp_access_hcl(action_request: dict[str, Any], route: dict[str, Any],
         raise NonRetryableJobError("Reviewed route has an invalid GCP IAM role")
     if role in BASIC_GCP_ROLES:
         raise NonRetryableJobError("Basic GCP roles cannot expire; the access level must use a predefined role")
-    if module_source != "modules/gcp/iam_binding":
+    bucket = str(route.get("scope_identifier") or "") if route.get("scope_type") == "bucket" else None
+    expected_module = "modules/gcp/bucket_iam_binding" if bucket else "modules/gcp/iam_binding"
+    if bucket and not gcp._BUCKET.fullmatch(bucket):
+        raise NonRetryableJobError("Invalid reviewed bucket scope")
+    if module_source != expected_module:
         raise NonRetryableJobError("Reviewed route uses an unsupported Terraform module")
     request_id = str(action_request["id"])
     if not re.fullmatch(r"[0-9a-f-]{36}", request_id):
@@ -341,7 +398,8 @@ def render_gcp_access_hcl(action_request: dict[str, Any], route: dict[str, Any],
         f"# GCP stops honouring this grant at {expires_at}.\n\n"
         f"module {json.dumps(module_name)} {{\n"
         f"  source     = {json.dumps('../../' + module_source)}\n"
-        f"  project    = {json.dumps(project_id)}\n"
+        f"  project    = {json.dumps(project_id)}\n" +
+        (f"  bucket     = {json.dumps(bucket)}\n" if bucket else "") +
         f"  role       = {json.dumps(role)}\n"
         f"  member     = {json.dumps('user:' + email)}\n"
         f"  expires_at = {json.dumps(expires_at)}\n"
@@ -404,6 +462,14 @@ def proposal_files(action_request: dict[str, Any]) -> tuple[str, str, str, str]:
 
 def create_github_proposal(action_request: dict[str, Any], branch: str, file_path: str, content: str,
                            summary: str, change: dict[str, Any] | None = None) -> dict[str, Any]:
+    account, settings, policy, route = governance_context(action_request)
+    denials = governance.control_denials(action_request, account, settings, policy, route)
+    receipts = select("proposal_receipts", f"action_request_id=eq.{action_request['id']}&limit=1")
+    if denials or len(receipts) != 1:
+        raise NonRetryableJobError("Proposal is not authorized: " + "; ".join(denials or ["missing immutable receipt"]))
+    receipt = receipts[0]
+    if receipt["artifact_path"] != file_path or receipt["artifact_sha256"] != governance.digest(content) or datetime.fromisoformat(receipt["expires_at"].replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+        raise NonRetryableJobError("Proposal content changed or its approval window expired")
     repo, _, _, _ = github_config()
     token = github_installation_token()
     request_id = str(action_request["id"])
@@ -462,6 +528,10 @@ def servicenow_reference(job: dict[str, Any]) -> dict[str, Any]:
 @register_handler("create_github_proposal")
 def handle_github_proposal(job: dict[str, Any]) -> None:
     action_request = load_request(job)
+    controls = select("governance_settings", f"tenant_id=eq.{action_request['tenant_id']}&limit=1")
+    if controls and controls[0].get("proposals_paused"):
+        rpc("defer_governance_job", {"p_job": job["id"], "p_worker": WORKER_ID})
+        return
     branch, file_path, content, summary = proposal_files(action_request)
     proposal = create_github_proposal(action_request, branch, file_path, content, summary, servicenow_reference(job))
     rpc("complete_github_proposal", {
@@ -548,6 +618,8 @@ def handle_delivery_tracking(job: dict[str, Any]) -> None:
     )
     if state == "completed" and action_request.get("capability") == "access_grant":
         details["expires_at"] = access_expires_at(action_request)
+    if state == "completed":
+        verify_delivered_change(action_request)
     if state in ("completed", "failed", "cancelled"):
         note_servicenow_outcome(job, state, details)
     rpc("record_github_delivery", {
@@ -555,6 +627,43 @@ def handle_delivery_tracking(job: dict[str, Any]) -> None:
         "p_details": details, "p_recheck_seconds": recheck or PR_RECHECK_SECONDS,
     })
     LOGGER.info("delivery_checked job=%s request=%s state=%s", job["id"], action_request["id"], state)
+
+
+def upsert(table: str, row: dict[str, Any], conflict: str) -> None:
+    request_json(f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={urllib.parse.quote(conflict, safe=',')}", method="POST", body=row, supabase=True, extra_headers={"Prefer": "resolution=merge-duplicates"})
+
+
+def verify_delivered_change(action_request: dict[str, Any]) -> None:
+    try:
+        account = cloud_account(str(action_request["tenant_id"]))
+        if action_request["capability"] == "label_fix":
+            expected = json.loads(render_label_fix(action_request, account["project_id"], user_email(action_request["requester_id"])))
+            result = governance.verify_labels(expected["add_labels"], gcp.bucket_labels(expected["bucket"]))
+        else:
+            scope = (action_request.get("policy_decision") or {}).get("reviewed_scope")
+            if scope:
+                project, role = scope["project"], scope["role"]
+                bucket = scope["resource"] if scope["type"] == "bucket" else None
+            else:  # Legacy read-back only; legacy proposals cannot enter the execution gate.
+                _, _, _, route = governance_context(action_request)
+                if not route:
+                    raise NonRetryableJobError("The reviewed entitlement is no longer available")
+                project, role = account["project_id"], route["role_identifier"]
+                bucket = route.get("scope_identifier") if route.get("scope_type") == "bucket" else None
+            observed = gcp.iam_policy(project, bucket)
+            result = governance.verify_iam(observed, role, "user:" + user_email(action_request.get("beneficiary_id") or action_request["requester_id"]), access_expires_at(action_request))
+    except Exception as exc:
+        result = {"state": "unavailable", "details": {"reason": type(exc).__name__, "scope": "Cloud read-back could not finish; CI success is not treated as verification"}}
+    upsert("change_verifications", {"action_request_id": action_request["id"], "tenant_id": action_request["tenant_id"], **result, "checked_at": datetime.now(timezone.utc).isoformat()}, "action_request_id")
+
+
+@register_handler("verify_change")
+def handle_change_verification(job: dict[str, Any]) -> None:
+    request = load_request(job)
+    if request["status"] != "completed" or request["capability"] not in ("access_grant", "label_fix"):
+        raise NonRetryableJobError("Only delivered cloud changes can be verified")
+    verify_delivered_change(request)
+    rpc("complete_change_verification", {"p_job": job["id"], "p_worker": WORKER_ID})
 
 
 def note_servicenow_outcome(job: dict[str, Any], state: str, details: dict[str, Any]) -> None:
@@ -602,10 +711,33 @@ def describe_request(action_request: dict[str, Any], requester: str, project_id:
 @register_handler("servicenow_approval")
 def handle_servicenow_approval(job: dict[str, Any]) -> None:
     action_request = load_request(job)
+    controls = select("governance_settings", f"tenant_id=eq.{action_request['tenant_id']}&limit=1")
+    if controls and controls[0].get("proposals_paused"):
+        rpc("defer_governance_job", {"p_job": job["id"], "p_worker": WORKER_ID})
+        return
     config = servicenow.ServiceNowConfig.from_env()
     requester = user_email(action_request.get("requester_id"))
     project = cloud_account(str(action_request["tenant_id"]))["project_id"]
+    account, settings, policy, route = governance_context(action_request)
+    denials = governance.control_denials(action_request, account, settings, policy, route)
+    if denials:
+        raise NonRetryableJobError("; ".join(denials))
+    _, file_path, content, _ = proposal_files({**action_request, "status": "proposal_pending"})
+    existing = select("proposal_receipts", f"action_request_id=eq.{action_request['id']}&limit=1")
+    if existing:
+        receipt = existing[0]
+        if receipt["artifact_sha256"] != governance.digest(content):
+            raise NonRetryableJobError("The proposal differs from the immutable approval receipt")
+    else:
+        expiry = datetime.now(timezone.utc) + timedelta(minutes=settings["approval_ttl_minutes"])
+        if action_request["capability"] == "access_grant":
+            expiry = min(expiry, datetime.fromisoformat(access_expires_at(action_request).replace("Z", "+00:00")))
+        receipt = {"action_request_id": action_request["id"], "tenant_id": action_request["tenant_id"], "project_id": project, "artifact_path": file_path, "artifact_sha256": governance.digest(content), "policy_sha256": governance.digest(action_request.get("policy_decision") or {}), "expires_at": expiry.isoformat()}
+        insert("proposal_receipts", receipt)
+    if datetime.fromisoformat(receipt["expires_at"].replace("Z", "+00:00")) <= datetime.now(timezone.utc):
+        raise NonRetryableJobError("The approval window expired; submit a fresh request")
     title, body = describe_request(action_request, requester, project)
+    body += f"\n\nArtifact: {file_path}\nSHA-256: {receipt['artifact_sha256']}\nPolicy SHA-256: {receipt['policy_sha256']}\nApproval expires: {receipt['expires_at']}"
     change = servicenow.open_change_for_approval(config, request_id=str(action_request["id"]), requester_email=requester,
                                                  short_description=title, description=body)
     decision = servicenow.approval_decision(config, change["change_sys_id"], requester)
@@ -630,6 +762,12 @@ def handle_log_search(job: dict[str, Any]) -> None:
         "p_job_id": job["id"], "p_worker_id": WORKER_ID,
         "p_summary": gcp.summarize_findings(findings, hint, hours), "p_findings": findings,
     })
+    try:
+        changes = gcp.related_change_events(project, hint, hours)
+        context_state = "available"
+    except Exception:
+        changes, context_state = [], "unavailable"
+    upsert("triage_change_context", {"action_request_id": action_request["id"], "tenant_id": action_request["tenant_id"], "changes": changes, "state": context_state, "coverage": {"window_hours": hours, "log_row_limit": 50, "returned_log_rows": len(findings), "audit_row_limit": 20, "statement": "Temporal matches are evidence for investigation, not proof of causation"}}, "action_request_id")
     LOGGER.info("log_search job=%s request=%s findings=%s", job["id"], action_request["id"], len(findings))
 
 
@@ -710,6 +848,25 @@ def persist_failure(job: dict[str, Any], exc: Exception) -> None:
     })
 
 
+def source_health(tenant: str, project: str, source: str, state: str, summary: str) -> None:
+    upsert("cloud_source_health", {"tenant_id": tenant, "project_id": project, "source": source, "state": state, "summary": summary[:400], "checked_at": datetime.now(timezone.utc).isoformat()}, "tenant_id,project_id,source")
+
+
+def refresh_inventory(tenant: str, project: str) -> None:
+    try:
+        assets = gcp.resource_inventory(project)
+        previous = select("cloud_snapshots", f"tenant_id=eq.{tenant}&project_id=eq.{project}&kind=eq.inventory&order=captured_at.desc&limit=1")
+        if previous:
+            before = {a["name"]: a for a in previous[0]["data"].get("assets", [])}
+            after = {a["name"]: a for a in assets}
+            changes = [{"name": name, "change": "added" if name not in before else "removed" if name not in after else "metadata_changed", "before": before.get(name), "after": after.get(name)} for name in sorted(before.keys() | after.keys()) if before.get(name) != after.get(name)]
+            insert("cloud_snapshots", {"tenant_id": tenant, "project_id": project, "kind": "observed_drift", "data": {"baseline_captured_at": previous[0]["captured_at"], "changes": changes, "scope": "Observed inventory metadata changes, not approved-IaC drift"}})
+        insert("cloud_snapshots", {"tenant_id": tenant, "project_id": project, "kind": "inventory", "data": {"assets": assets, "total": len(assets)}})
+        source_health(tenant, project, "inventory", "healthy", f"Read {len(assets)} resources from Cloud Asset Inventory")
+    except Exception as exc:
+        source_health(tenant, project, "inventory", "error", f"Inventory read failed ({type(exc).__name__}); verify Cloud Asset API and reader permissions")
+
+
 def insert(table: str, row: dict[str, Any]) -> None:
     request_json(f"{SUPABASE_URL}/rest/v1/{table}", method="POST", body=row, supabase=True)
 
@@ -719,6 +876,7 @@ def refresh_snapshots(now: datetime | None = None) -> None:
     now = now or datetime.now(timezone.utc)
     for account in select("tenant_cloud_accounts", "select=tenant_id,project_id,billing_table&cloud=eq.gcp&enabled=eq.true"):
         tenant, project = account["tenant_id"], account["project_id"]
+        refresh_inventory(tenant, project)
         try:
             buckets = gcp.list_buckets(project)
             items = [{"bucket": b["name"], "location": b["location"], "labels": b["labels"],
@@ -726,9 +884,12 @@ def refresh_snapshots(now: datetime | None = None) -> None:
             insert("cloud_snapshots", {"tenant_id": tenant, "kind": "label_compliance", "project_id": project, "data": {
                 "required": list(gcp.REQUIRED_LABELS), "buckets": items,
                 "compliant": sum(1 for item in items if not item["missing"]), "total": len(items)}})
+            source_health(tenant, project, "labels", "healthy", f"Read labels for {len(items)} buckets")
         except Exception:
             LOGGER.exception("label_snapshot_failed tenant=%s", tenant)
+            source_health(tenant, project, "labels", "error", "Bucket metadata read failed")
         if not account.get("billing_table"):
+            source_health(tenant, project, "billing", "unavailable", "No billing export table is configured")
             continue
         month = now.strftime("%Y%m")
         try:
@@ -738,8 +899,10 @@ def refresh_snapshots(now: datetime | None = None) -> None:
             insert("cloud_snapshots", {"tenant_id": tenant, "kind": "cost", "project_id": project, "data": {
                 "month": month, "currency": next((row["currency"] for row in rows if row.get("currency")), None),
                 "total": total, "untagged": untagged, "rows": rows}})
+            source_health(tenant, project, "billing", "healthy", f"Read {len(rows)} billing groups")
         except Exception:
             LOGGER.exception("cost_snapshot_failed tenant=%s", tenant)
+            source_health(tenant, project, "billing", "error", "Billing export could not be queried")
 
 
 def export_audit_events() -> int:
@@ -832,6 +995,32 @@ def start_health_server() -> None:
         def do_GET(self) -> None:  # noqa: N802 - stdlib name
             body = json.dumps({"status": "ok", "worker_id": WORKER_ID, "job_types": registered_job_types()}).encode()
             self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:  # noqa: N802
+            status, result = 403, {"error": "Pipeline authentication required"}
+            try:
+                expected = required_env("AEGIS_PIPELINE_CALLER")
+                audience = required_env("AEGIS_GATE_AUDIENCE")
+                from google.oauth2 import id_token
+                import google.auth.transport.requests
+                token = self.headers.get("X-Aegis-Token", "")
+                identity = id_token.verify_oauth2_token(token, google.auth.transport.requests.Request(), audience=audience)
+                if identity.get("email") != expected or not identity.get("email_verified") or self.path != "/governance/plan":
+                    raise ValueError("Caller or route is not authorized")
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 100000:
+                    raise ValueError("Invalid request size")
+                payload = json.loads(self.rfile.read(size))
+                status, result = plan_gate.authorize(payload, sys.modules[__name__])
+            except Exception as exc:
+                LOGGER.warning("pipeline_gate_failed type=%s", type(exc).__name__)
+                result = {"error": "The execution gate could not validate this request"}
+            body = json.dumps(result).encode()
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()

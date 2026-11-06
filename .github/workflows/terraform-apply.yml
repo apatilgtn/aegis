@@ -22,7 +22,14 @@ on:
       - "infra/access-grants/**"
       - "infra/label-fixes/**"
       - "scripts/apply_label_fixes.py"
+      - "scripts/label_plan.py"
+      - "scripts/pipeline_plan_gate.py"
+      - "modules/gcp/**"
       - ".github/workflows/terraform-apply.yml"
+
+concurrency:
+  group: aegis-production-apply
+  cancel-in-progress: false
 
 permissions:
   id-token: write
@@ -31,9 +38,16 @@ permissions:
 jobs:
   gcp-apply-access-grants:
     runs-on: ubuntu-latest
-    if: ${{ vars.GCP_PROJECT_ID != '' }}
+    if: ${{ vars.GCP_PROJECT_ID != '' && vars.AEGIS_GATE_URL != '' }}
+    timeout-minutes: 45
+    environment: production
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      AEGIS_GATE_URL: ${{ vars.AEGIS_GATE_URL }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - id: auth
         uses: google-github-actions/auth@v2
@@ -41,6 +55,14 @@ jobs:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_PIPELINE_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.AEGIS_GATE_URL }}
+          id_token_include_email: true
+
+      - name: Verify authenticated execution gate
+        env:
+          AEGIS_GATE_TOKEN: ${{ steps.auth.outputs.id_token }}
+        run: python3 scripts/pipeline_plan_gate.py --smoke
 
       - uses: hashicorp/setup-terraform@v3
         with:
@@ -54,7 +76,45 @@ jobs:
         working-directory: infra/access-grants
         run: terraform plan -out=tfplan
 
+      - name: Extract plan metadata without logging values
+        working-directory: infra/access-grants
+        run: terraform show -json tfplan > tfplan.json
+
+      - id: gate-auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_PIPELINE_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.AEGIS_GATE_URL }}
+          id_token_include_email: true
+
+      - name: Wait for approval of this exact saved plan
+        id: gate
+        env:
+          AEGIS_GATE_TOKEN: ${{ steps.gate-auth.outputs.id_token }}
+        run: python3 scripts/pipeline_plan_gate.py --terraform-plan infra/access-grants/tfplan --terraform-json infra/access-grants/tfplan.json --wait
+
+      - id: apply-auth
+        if: steps.gate.outputs.changed == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_PIPELINE_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.AEGIS_GATE_URL }}
+          id_token_include_email: true
+
+      - name: Revalidate controls immediately before apply
+        if: steps.gate.outputs.changed == 'true'
+        env:
+          AEGIS_GATE_TOKEN: ${{ steps.apply-auth.outputs.id_token }}
+        run: python3 scripts/pipeline_plan_gate.py --terraform-plan infra/access-grants/tfplan --terraform-json infra/access-grants/tfplan.json
+
       - name: terraform apply
+        if: steps.gate.outputs.changed == 'true'
         working-directory: infra/access-grants
         run: terraform apply -auto-approve tfplan
 
@@ -63,9 +123,16 @@ jobs:
   # updating bucket metadata; it cannot create, delete or read objects.
   gcp-apply-label-fixes:
     runs-on: ubuntu-latest
-    if: ${{ vars.GCP_PROJECT_ID != '' }}
+    if: ${{ vars.GCP_PROJECT_ID != '' && vars.AEGIS_GATE_URL != '' }}
+    timeout-minutes: 45
+    environment: production
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      AEGIS_GATE_URL: ${{ vars.AEGIS_GATE_URL }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - id: auth
         uses: google-github-actions/auth@v2
@@ -73,8 +140,55 @@ jobs:
           project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_PIPELINE_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.AEGIS_GATE_URL }}
+          id_token_include_email: true
+
+      - name: Verify authenticated execution gate
+        env:
+          AEGIS_GATE_TOKEN: ${{ steps.auth.outputs.id_token }}
+        run: python3 scripts/pipeline_plan_gate.py --smoke
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: apply label fixes
-        run: python3 scripts/apply_label_fixes.py
+      - name: Prepare exact missing-label patches
+        env:
+          GITHUB_BEFORE: ${{ github.event.before }}
+        run: python3 scripts/label_plan.py --prepare /tmp/aegis-label-plan.json
+
+      - id: gate-auth
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_PIPELINE_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.AEGIS_GATE_URL }}
+          id_token_include_email: true
+
+      - name: Wait for approval of the label plan
+        id: gate
+        env:
+          AEGIS_GATE_TOKEN: ${{ steps.gate-auth.outputs.id_token }}
+        run: python3 scripts/pipeline_plan_gate.py --label-plan /tmp/aegis-label-plan.json --wait
+
+      - id: apply-auth
+        if: steps.gate.outputs.changed == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_PIPELINE_SA }}
+          token_format: id_token
+          id_token_audience: ${{ vars.AEGIS_GATE_URL }}
+          id_token_include_email: true
+
+      - name: Revalidate controls immediately before patching
+        if: steps.gate.outputs.changed == 'true'
+        env:
+          AEGIS_GATE_TOKEN: ${{ steps.apply-auth.outputs.id_token }}
+        run: python3 scripts/pipeline_plan_gate.py --label-plan /tmp/aegis-label-plan.json
+
+      - name: Apply only the exact approved patches
+        if: steps.gate.outputs.changed == 'true'
+        run: python3 scripts/label_plan.py --apply /tmp/aegis-label-plan.json

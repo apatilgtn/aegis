@@ -1,0 +1,11 @@
+# This file is resolved from the repository root by --ignore-file.
+*
+!portal/
+!portal/**
+portal/.next/
+portal/node_modules/
+portal/.env
+portal/.env.*
+portal/tests/
+**/*.tsbuildinfo
+**/.git/

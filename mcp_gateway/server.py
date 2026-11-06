@@ -15,9 +15,10 @@ import sys
 import time
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from governed_requests import portal_call
 import gcp  # noqa: E402  (copied next to this file in the image)
 
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
@@ -34,6 +35,9 @@ def audited(tool: str, args: dict[str, Any], call):
     except gcp.GcpError as exc:
         outcome = "error"
         raise ValueError(str(exc)) from exc
+    except Exception:
+        outcome = "error"
+        raise
     finally:
         print(json.dumps({"severity": "NOTICE", "message": "aegis_mcp_tool_call", "tool": tool, "args": args,
                           "outcome": outcome, "ms": round((time.monotonic() - started) * 1000)}), flush=True)
@@ -66,6 +70,29 @@ def cost_by_cost_center(month: str) -> dict[str, Any]:
             raise gcp.GcpError("Billing export is not connected for this project", retryable=False)
         return {"rows": gcp.cost_by_cost_center(PROJECT_ID, BILLING_TABLE, month)}
     return audited("cost_by_cost_center", {"month": month}, run)
+
+
+@mcp.tool()
+def governed_capabilities(ctx: Context) -> dict[str, Any]:
+    """Read available capabilities, project classifications and pause controls for the authenticated Aegis user."""
+    return audited("governed_capabilities", {}, lambda: portal_call(ctx, "capabilities"))
+
+
+@mcp.tool()
+def submit_governed_request(capability: str, fields: dict[str, Any], idempotency_key: str, ctx: Context) -> dict[str, Any]:
+    """Submit an explicitly requested proposal, never a cloud mutation. The user must authorize submission. Normal policy, ITSM approval, PR merge and exact-plan approval gates still apply. Credentials come from HTTP headers, not tool arguments."""
+    if capability not in ("access_grant", "label_fix", "incident_triage"):
+        raise ValueError("Unsupported capability")
+    return audited("submit_governed_request", {"capability": capability}, lambda: portal_call(ctx, "requests", {**fields, "capability": capability}, idempotency_key))
+
+
+@mcp.tool()
+def governed_request_status(request_id: str, ctx: Context) -> dict[str, Any]:
+    """Read the status of a request visible to the authenticated Aegis user."""
+    import re
+    if not re.fullmatch(r"[0-9a-f-]{36}", request_id):
+        raise ValueError("Invalid request ID")
+    return audited("governed_request_status", {"request_id": request_id}, lambda: portal_call(ctx, "requests/" + request_id))
 
 
 if __name__ == "__main__":

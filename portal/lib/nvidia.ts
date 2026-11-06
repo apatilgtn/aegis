@@ -1,3 +1,4 @@
+import { reserveAiCall, settleAiCall } from "@/lib/ai-telemetry";
 // Server-side only: imported from app/actions.ts ("use server"), never from client components.
 // NVIDIA-hosted models via their OpenAI-compatible endpoint (build.nvidia.com).
 // The key stays on the server. The model only drafts text or form fields;
@@ -10,12 +11,17 @@ const MODEL = process.env.NVIDIA_MODEL ?? "nvidia/nemotron-3.5-lightning-30b-a3b
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
 export function nvidiaConfigured() {
-  return Boolean(process.env.NVIDIA_API_KEY);
+  return Boolean(process.env.NVIDIA_API_KEY?.trim());
 }
 
 export async function chat(messages: ChatMessage[], { json = false, maxTokens = 600 } = {}): Promise<string> {
-  const key = process.env.NVIDIA_API_KEY;
+  const key = process.env.NVIDIA_API_KEY?.trim();
   if (!key) throw new Error("NVIDIA_API_KEY is not set");
+  const reservation = await reserveAiCall(messages, maxTokens);
+  const selectedModel = reservation.model ?? MODEL;
+  const started = performance.now();
+  let usage: { input: number | null; output: number | null } = { input: null, output: null };
+  let success = false;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 25_000);
   try {
@@ -24,7 +30,7 @@ export async function chat(messages: ChatMessage[], { json = false, maxTokens = 
       signal: controller.signal,
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({
-        model: MODEL,
+        model: selectedModel,
         messages,
         temperature: 0.1,
         max_tokens: maxTokens,
@@ -37,9 +43,12 @@ export async function chat(messages: ChatMessage[], { json = false, maxTokens = 
     const body = await response.json();
     const content = body?.choices?.[0]?.message?.content;
     if (typeof content !== "string" || !content.trim()) throw new Error("NVIDIA API returned no answer");
+    usage = { input: Number.isSafeInteger(body?.usage?.prompt_tokens) ? body.usage.prompt_tokens : null, output: Number.isSafeInteger(body?.usage?.completion_tokens) ? body.usage.completion_tokens : null };
+    success = true;
     return content.trim();
   } finally {
     clearTimeout(timer);
+    await settleAiCall(reservation.id, selectedModel, usage, performance.now() - started, success);
   }
 }
 
@@ -58,6 +67,11 @@ const nearest = (value: unknown, allowed: number[], fallback: number) => {
 };
 const text = (value: unknown, limit: number) => (typeof value === "string" ? value.replace(/[\u0000-\u001f]/g, " ").trim().slice(0, limit) : "");
 
+/** Information questions should be answered, never turned into change requests. */
+export function isWorkspaceQuestion(value: string) {
+  return /^(what|which|how|why|when|where|who|is|are|do|does|show|list|tell me|can you (show|list|tell))\b/i.test(value.trim());
+}
+
 /** Turn free text into a draft for one of the three forms. Every field is re-validated by the form's server action. */
 export async function draftRequest(request: string, buckets: string[]): Promise<RequestDraft> {
   const answer = await chat(
@@ -65,7 +79,7 @@ export async function draftRequest(request: string, buckets: string[]): Promise<
       {
         role: "system",
         content:
-          "You turn a cloud operations request into JSON for one of three forms. Reply with JSON only.\n" +
+          "You turn an explicit request to perform cloud operations into JSON for one of three forms. Reply with JSON only. Information questions about labels, costs or status are unknown, not action requests.\n" +
           'Access to GCP: {"capability":"access_grant","tier":"tier1"|"tier2","ttl_hours":number,"justification":string}. tier1 = read logs, tier2 = read/write storage objects.\n' +
           'Investigate a problem in logs: {"capability":"incident_triage","resource_hint":string,"time_window_hours":number,"justification":string}.\n' +
           'Add missing labels to a bucket: {"capability":"label_fix","bucket":string,"cost_center":string,"justification":string}. Known buckets: ' +

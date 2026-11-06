@@ -1,0 +1,20 @@
+# Substitutions contain browser-public configuration only. Server credentials
+# are mounted from Secret Manager at runtime and never enter this image.
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - portal/Dockerfile
+      - --build-arg
+      - NEXT_PUBLIC_SUPABASE_URL=${_SUPABASE_URL}
+      - --build-arg
+      - NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${_SUPABASE_PUBLISHABLE_KEY}
+      - --build-arg
+      - NEXT_PUBLIC_SITE_URL=${_SITE_URL}
+      - -t
+      - ${_IMAGE}
+      - .
+images: ['${_IMAGE}']
+options:
+  logging: CLOUD_LOGGING_ONLY
