@@ -37,11 +37,29 @@ export async function authenticate(_state: AuthState, formData: FormData): Promi
       },
     });
 
-    if (error) return { error: "We could not create the account. Check the details and try again." };
-    if (!data.session) return { message: "Check your email to verify the account, then sign in." };
+    if (error) {
+      console.error("[Aegis Auth] Sign-up error:", error.code, error.message);
+      if (error.code === "over_email_send_rate_limit" || error.message?.toLowerCase().includes("rate limit")) {
+        return { error: "Supabase email rate limit reached. Disable 'Confirm email' in Supabase Auth → Providers → Email, or wait before retrying." };
+      }
+      if (error.code === "email_address_invalid") {
+        return { error: `Supabase rejected this email address (${error.message}). Use a real email domain (e.g. @gmail.com).` };
+      }
+      if (error.code === "user_already_exists") {
+        return { error: "An account with this email already exists. Switch to 'Sign in'." };
+      }
+      return { error: `Could not create account: ${error.message}` };
+    }
+    if (!data.session) return { message: "Check your email to verify the account (or confirm the user in Supabase Dashboard → Authentication → Users), then sign in." };
   } else {
     const { error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) return { error: "The email or password is incorrect." };
+    if (error) {
+      console.error("[Aegis Auth] Sign-in error:", error.code, error.message);
+      if (error.code === "email_not_confirmed" || error.message?.toLowerCase().includes("email not confirmed")) {
+        return { error: "Your email is not confirmed yet. Click the verification link in your email, or confirm the user in Supabase Dashboard → Authentication → Users." };
+      }
+      return { error: `Sign-in failed: ${error.message}` };
+    }
   }
 
   redirect("/");

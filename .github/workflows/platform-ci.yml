@@ -3,8 +3,8 @@ name: Platform CI
 on:
   pull_request:
     paths:
-      - "agents/**"
       - "contracts/**"
+      - "mcp_gateway/**"
       - "mcp_servers/**"
       - "policy/**"
       - "scripts/**"
@@ -18,8 +18,8 @@ on:
   push:
     branches: [main]
     paths:
-      - "agents/**"
       - "contracts/**"
+      - "mcp_gateway/**"
       - "mcp_servers/**"
       - "policy/**"
       - "scripts/**"
@@ -46,8 +46,7 @@ jobs:
       - run: python -m pip install --requirement requirements.lock
       - run: python -m pip check
       - run: python -m pytest -q
-      - run: python -m py_compile worker/worker.py
-      - run: python -m py_compile scripts/p0_e2e.py
+      - run: python -m py_compile worker/worker.py worker/gcp.py worker/servicenow.py mcp_gateway/server.py scripts/p0_e2e.py scripts/apply_label_fixes.py
 
   policy-and-compose:
     runs-on: ubuntu-latest
@@ -73,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for directory in infra/access-grants infra/tag-remediations; do
+          for directory in infra/access-grants; do
             terraform -chdir="$directory" init -backend=false -input=false
             terraform -chdir="$directory" validate
           done

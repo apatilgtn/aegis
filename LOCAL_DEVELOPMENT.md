@@ -1,54 +1,36 @@
 # Aegis local runtime
 
-The local stack runs the portal, OPA and a durable workflow worker in Docker. Supabase remains the free hosted identity, Postgres and Realtime control plane.
+The normal runtime is the Cloud Run worker (`scripts/deploy_gcp.sh`). The local Docker stack runs the portal, OPA and a worker on your machine; Supabase stays the hosted identity, Postgres and Realtime control plane.
 
-## Secrets
+## Secrets (Infisical, dev environment)
 
-Create an Infisical project and add these development secrets:
+- `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY`
+- `GITHUB_REPO`, `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY`
+- `SN_INSTANCE_URL`, `SN_OAUTH_CLIENT_ID`, `SN_OAUTH_CLIENT_SECRET`, `SN_APPROVER_GROUP`
+- `GCP_PROJECT_ID`, `NVIDIA_API_KEY`, `NVIDIA_MODEL`
 
-- `SUPABASE_URL`
-- `SUPABASE_PUBLISHABLE_KEY`
-- `SUPABASE_SECRET_KEY`
-- `GITHUB_REPO`
-- `GITHUB_APP_ID`
-- `GITHUB_APP_INSTALLATION_ID`
-- `GITHUB_APP_PRIVATE_KEY`
-
-Use a Supabase secret key only in the worker. It must never be prefixed with `NEXT_PUBLIC_` or exposed to the browser.
-Give the GitHub App repository contents and pull-request write access only. Do not grant merge administration; protected branch reviewers perform the merge in GitHub.
+The Supabase secret key is for the worker only; never prefix it with `NEXT_PUBLIC_`. The GitHub App needs contents and pull-request write and actions read — never merge or administration rights.
 
 ## Machine identity bootstrap
 
-The worker image contains a pinned Infisical CLI and fetches its application secrets directly at startup. Only the Universal Auth bootstrap credential remains on the local host.
+1. Use the `aegis` machine identity's **Universal Auth Client ID** (not the identity ID) and a client secret.
+2. Save the client secret to `.secrets/infisical-client-secret` (excluded from Git and the Docker build context).
+3. `INFISICAL_CLIENT_ID` defaults to the Universal Auth Client ID in `docker-compose.yml`; `INFISICAL_PROJECT_ID` is the project ID. Neither is secret.
 
-1. Create a project-scoped machine identity with the `Viewer` role and Universal Auth.
-2. Put its client secret in `.secrets/infisical-client-secret`. This directory is excluded from Git and the Docker build context.
-3. Set `INFISICAL_CLIENT_ID` and `INFISICAL_PROJECT_ID` in your shell or a local Compose environment file. These identifiers are not secrets.
+The entrypoint exchanges the client secret for a short-lived token and injects secrets directly into the worker process; nothing is written to disk.
 
-Docker mounts the bootstrap credential read-only at `/run/secrets`. The entrypoint exchanges it for a short-lived token, clears the Universal Auth credential from the environment, and uses `infisical run` to inject application secrets directly into the worker process. No application-secret export is written to disk.
+## GCP access for the local worker
 
-## Start
+On Cloud Run the worker signs in as `aegis-reader` automatically. A local worker has no GCP identity, so log search, label checks and audit export fail locally unless you provide Application Default Credentials (for example `gcloud auth application-default login --impersonate-service-account=aegis-reader@<project>.iam.gserviceaccount.com`). Run only one worker at a time against the same Supabase project.
 
-```powershell
-docker compose up --build
+## Start / verify / stop
+
+```bash
+docker compose up --build                       # portal :3000, OPA :8181, worker
+docker compose run --rm opa test /policies      # policy tests
+docker compose down
 ```
-
-OPA is available at `http://localhost:8181`; the portal is at `http://localhost:3000`. The worker polls atomically leased jobs, heartbeats active leases and applies exponential retries. It does not hold cloud credentials and does not merge pull requests.
 
 ## Workflow lifecycle
 
-Submitting an access request creates an idempotent `evaluate_policy` job. The worker evaluates it through OPA and moves an allowed request to `awaiting_approval`. An independent approver can approve or reject it; self-approval is blocked in the database. Approval moves the request to `proposal_pending` and queues an idempotent `create_github_proposal` job. That job remains unclaimed until the GitHub App proposal handler is enabled.
-
-Only the Supabase server role can claim, heartbeat, complete or fail jobs. Browser clients observe requests, approvals and workflow events through tenant-scoped RLS and Realtime.
-
-## Verify policy
-
-```powershell
-docker compose run --rm opa test /policies
-```
-
-## Stop
-
-```powershell
-docker compose down
-```
+A request creates an `evaluate_policy` job. Allowed access and label-fix requests move to `awaiting_approval` and a `servicenow_approval` job opens a change and polls its approvals; approval queues `create_github_proposal`, then `track_github_delivery` follows the merge and pipeline. Allowed investigations queue `search_logs`; the requester then raises (`create_servicenow_incident`) or closes the search. Only the Supabase service role can claim, heartbeat, complete or fail jobs.

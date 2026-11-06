@@ -18,7 +18,7 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     environment:
-      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-84f88ae4-dfca-4a04-bae5-700c4c667650}
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-3c7d6cab-e4bf-41ad-8e14-a1d093f2b3d3}
       INFISICAL_PROJECT_ID: ${INFISICAL_PROJECT_ID:-3e184311-abb6-4588-9b8b-09f89b219eac}
       INFISICAL_API_URL: ${INFISICAL_API_URL:-https://app.infisical.com}
       INFISICAL_ENVIRONMENT: ${INFISICAL_ENVIRONMENT:-dev}

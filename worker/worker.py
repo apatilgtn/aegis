@@ -25,6 +25,12 @@ from typing import Any
 
 import jwt
 
+try:  # imported as a package (tests)
+    from . import gcp, servicenow
+except ImportError:  # run as /app/worker.py
+    import gcp  # type: ignore[no-redef]
+    import servicenow  # type: ignore[no-redef]
+
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
 LOGGER = logging.getLogger("aegis.worker")
@@ -48,6 +54,8 @@ WORKER_ID = os.getenv("WORKER_ID", f"{socket.gethostname()}-{os.getpid()}")
 POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "2")))
 HEARTBEAT_SECONDS = max(10.0, min(float(os.getenv("HEARTBEAT_SECONDS", "30")), 90.0))
 LEASE_EXTENSION_SECONDS = max(60, min(int(os.getenv("LEASE_EXTENSION_SECONDS", "120")), 600))
+SNAPSHOT_SECONDS = max(300, int(os.getenv("SNAPSHOT_SECONDS", "900")))
+AUDIT_EXPORT_SECONDS = max(30, int(os.getenv("AUDIT_EXPORT_SECONDS", "60")))
 
 
 class NonRetryableJobError(RuntimeError):
@@ -76,8 +84,9 @@ def registered_job_types() -> list[str]:
     return sorted(JOB_HANDLERS)
 
 
-def request_json(url: str, *, method: str = "GET", body: dict[str, Any] | None = None, supabase: bool = False) -> Any:
-    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+def request_json(url: str, *, method: str = "GET", body: dict[str, Any] | None = None, supabase: bool = False,
+                 extra_headers: dict[str, str] | None = None) -> Any:
+    headers = {"Accept": "application/json", "Content-Type": "application/json", **(extra_headers or {})}
     if supabase:
         headers.update({"apikey": SUPABASE_SECRET_KEY, "Authorization": f"Bearer {SUPABASE_SECRET_KEY}"})
     payload = None if body is None else json.dumps(body).encode("utf-8")
@@ -108,7 +117,7 @@ def load_request(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("Workflow run does not exist")
     requests = select(
         "action_requests",
-        "select=id,tenant_id,requester_id,beneficiary_id,service_id,capability,justification,status,resource"
+        "select=id,tenant_id,requester_id,beneficiary_id,service_id,capability,justification,status,resource,policy_decision,decided_at"
         f"&id=eq.{runs[0]['action_request_id']}&limit=1",
     )
     if not requests:
@@ -116,22 +125,64 @@ def load_request(job: dict[str, Any]) -> dict[str, Any]:
     return requests[0]
 
 
-def evaluate_policy(action_request: dict[str, Any]) -> dict[str, Any]:
+def user_email(user_id: str | None) -> str:
+    if not user_id or not re.fullmatch(r"[0-9a-f-]{36}", str(user_id)):
+        raise NonRetryableJobError("Request has no valid user")
+    user = request_json(f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}", supabase=True)
+    email = str(user.get("email") or "").strip().lower() if isinstance(user, dict) else ""
+    if not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}", email):
+        raise NonRetryableJobError("User has no valid authenticated email address")
+    return email
+
+
+def cloud_account(tenant_id: str) -> dict[str, Any]:
+    rows = select("tenant_cloud_accounts",
+                  f"select=project_id,environment,billing_table&tenant_id=eq.{tenant_id}&cloud=eq.gcp&enabled=eq.true&limit=2")
+    if len(rows) != 1:
+        raise NonRetryableJobError("Workspace has no single governed GCP project")
+    return rows[0]
+
+
+POLICY_PATHS = {
+    "access_grant": "aegis/access_request",
+    "incident_triage": "aegis/incident_triage",
+    "label_fix": "aegis/label_fix",
+}
+
+
+def policy_input(action_request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (OPA input, extra facts to keep with the decision)."""
+    capability = action_request.get("capability")
     resource = action_request.get("resource") or {}
-    policy_input = {
-        "request": {
-            "cloud": resource.get("cloud"),
-            "environment": resource.get("environment"),
-            "tier": resource.get("tier"),
-            "ttl_hours": resource.get("ttl_hours"),
-            "justification": action_request.get("justification", ""),
-        }
-    }
-    response = request_json(f"{OPA_URL}/v1/data/aegis/access_request/decision", method="POST", body={"input": policy_input})
+    justification = action_request.get("justification", "")
+    if capability == "access_grant":
+        return {"cloud": resource.get("cloud"), "environment": resource.get("environment"), "tier": resource.get("tier"),
+                "ttl_hours": resource.get("ttl_hours"), "justification": justification}, {}
+    if capability == "incident_triage":
+        return {"cloud": resource.get("cloud"), "resource_hint": resource.get("resource_hint", ""),
+                "time_window_hours": resource.get("time_window_hours"), "justification": justification}, {}
+    if capability == "label_fix":
+        # The live labels decide what gets proposed; the portal's view may be stale.
+        bucket = str(resource.get("bucket") or "")
+        current = gcp.bucket_labels(bucket)
+        missing = gcp.missing_labels(current)
+        return {"cloud": resource.get("cloud"), "environment": resource.get("environment"), "bucket": bucket,
+                "cost_center": resource.get("cost_center", ""), "labels_to_add": missing,
+                "justification": justification}, {"labels_to_add": missing, "labels_before": current}
+    raise NonRetryableJobError(f"Unsupported capability: {capability}")
+
+
+def evaluate_policy(action_request: dict[str, Any]) -> dict[str, Any]:
+    capability = str(action_request.get("capability"))
+    path = POLICY_PATHS.get(capability)
+    if path is None:
+        raise NonRetryableJobError(f"Unsupported capability: {capability}")
+    request_input, facts = policy_input(action_request)
+    response = request_json(f"{OPA_URL}/v1/data/{path}/decision", method="POST", body={"input": {"request": request_input}})
     decision = response.get("result") if isinstance(response, dict) else None
     if not isinstance(decision, dict) or not isinstance(decision.get("allowed"), bool):
         raise RuntimeError("OPA returned no valid decision")
-    return decision
+    return {**decision, **facts}
 
 
 @register_handler("evaluate_policy")
@@ -218,11 +269,12 @@ def clean_pr_text(value: str, limit: int) -> str:
 
 
 def load_proposal_context(job: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str]:
-    action_request = load_request(job)
+    return load_proposal_context_for(load_request(job))
+
+
+def load_proposal_context_for(action_request: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], str]:
     if action_request.get("status") != "proposal_pending":
         raise NonRetryableJobError("Action request is not approved and proposal_pending")
-    if action_request.get("capability") != "access_grant":
-        raise NonRetryableJobError("Only access_grant proposals are supported")
     resource = action_request.get("resource") or {}
     for field in ("cloud", "environment", "tier", "ttl_hours"):
         if field not in resource:
@@ -241,12 +293,27 @@ def load_proposal_context(job: dict[str, Any]) -> tuple[dict[str, Any], dict[str
     ttl_hours = resource.get("ttl_hours")
     if not isinstance(ttl_hours, int) or ttl_hours < 1 or ttl_hours > int(routes[0]["max_ttl_hours"]):
         raise NonRetryableJobError("Requested duration exceeds the reviewed entitlement limit")
-    beneficiary_id = action_request.get("beneficiary_id") or action_request.get("requester_id")
-    user = request_json(f"{SUPABASE_URL}/auth/v1/admin/users/{beneficiary_id}", supabase=True)
-    email = str(user.get("email") or "").strip().lower() if isinstance(user, dict) else ""
-    if not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}", email):
-        raise NonRetryableJobError("Beneficiary has no valid authenticated email address")
+    email = user_email(action_request.get("beneficiary_id") or action_request.get("requester_id"))
     return action_request, routes[0], email
+
+
+BASIC_GCP_ROLES = {"roles/owner", "roles/editor", "roles/viewer"}
+
+
+def access_expires_at(action_request: dict[str, Any]) -> str:
+    """Expiry = approval time + requested duration, so re-rendering is deterministic."""
+    decided_at = str(action_request.get("decided_at") or "")
+    try:
+        approved = datetime.fromisoformat(decided_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise NonRetryableJobError("Approved request has no valid approval time") from exc
+    if approved.tzinfo is None:
+        raise NonRetryableJobError("Approval time has no timezone")
+    ttl_hours = (action_request.get("resource") or {}).get("ttl_hours")
+    if not isinstance(ttl_hours, int) or ttl_hours < 1:
+        raise NonRetryableJobError("Request has no valid duration")
+    expires = approved.astimezone(timezone.utc).replace(microsecond=0) + timedelta(hours=ttl_hours)
+    return expires.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def render_gcp_access_hcl(action_request: dict[str, Any], route: dict[str, Any], email: str) -> str:
@@ -259,21 +326,25 @@ def render_gcp_access_hcl(action_request: dict[str, Any], route: dict[str, Any],
         raise NonRetryableJobError("Reviewed route has an invalid GCP project ID")
     if not re.fullmatch(r"roles/[A-Za-z0-9_.]+", role):
         raise NonRetryableJobError("Reviewed route has an invalid GCP IAM role")
+    if role in BASIC_GCP_ROLES:
+        raise NonRetryableJobError("Basic GCP roles cannot expire; the access level must use a predefined role")
     if module_source != "modules/gcp/iam_binding":
         raise NonRetryableJobError("Reviewed route uses an unsupported Terraform module")
     request_id = str(action_request["id"])
     if not re.fullmatch(r"[0-9a-f-]{36}", request_id):
         raise NonRetryableJobError("Action request ID is not a UUID")
     module_name = f"aegis_request_{request_id.replace('-', '_')}"
+    expires_at = access_expires_at(action_request)
     return (
         "# Generated by Aegis Governed Delivery. Do not edit manually.\n"
         f"# action_request_id: {request_id}\n"
-        f"# expires_after_hours: {action_request['resource']['ttl_hours']}\n\n"
+        f"# GCP stops honouring this grant at {expires_at}.\n\n"
         f"module {json.dumps(module_name)} {{\n"
-        f"  source  = {json.dumps('../../' + module_source)}\n"
-        f"  project = {json.dumps(project_id)}\n"
-        f"  role    = {json.dumps(role)}\n"
-        f"  member  = {json.dumps('user:' + email)}\n"
+        f"  source     = {json.dumps('../../' + module_source)}\n"
+        f"  project    = {json.dumps(project_id)}\n"
+        f"  role       = {json.dumps(role)}\n"
+        f"  member     = {json.dumps('user:' + email)}\n"
+        f"  expires_at = {json.dumps(expires_at)}\n"
         "}\n"
     )
 
@@ -285,13 +356,57 @@ def find_pull_request(repo: str, branch: str, token: str) -> dict[str, Any] | No
     return pulls[0] if pulls else None
 
 
-def create_github_proposal(action_request: dict[str, Any], route: dict[str, Any], email: str) -> dict[str, Any]:
+def render_label_fix(action_request: dict[str, Any], project_id: str, requester: str) -> str:
+    """The reviewed file the pipeline applies: only missing required labels."""
+    resource = action_request.get("resource") or {}
+    decision = action_request.get("policy_decision") or {}
+    missing = decision.get("labels_to_add")
+    if not isinstance(missing, list) or not missing or not set(missing) <= set(gcp.REQUIRED_LABELS):
+        raise NonRetryableJobError("Approved request has no valid list of labels to add")
+    values = {
+        "owner": gcp.label_value(requester.replace("@", "-at-")),
+        "cost-center": gcp.label_value(str(resource.get("cost_center") or "")),
+        "environment": gcp.label_value(str(resource.get("environment") or "")),
+    }
+    bucket = str(resource.get("bucket") or "")
+    if not gcp._BUCKET.fullmatch(bucket):
+        raise NonRetryableJobError("Approved request has an invalid bucket name")
+    document = {
+        "action_request_id": str(action_request["id"]),
+        "project": project_id,
+        "bucket": bucket,
+        "add_labels": {key: values[key] for key in sorted(missing)},
+        "note": "Generated by Aegis. Only labels that are missing at apply time are set; existing labels are never changed.",
+    }
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
+
+
+def proposal_files(action_request: dict[str, Any]) -> tuple[str, str, str, str]:
+    """Return (branch, file_path, content, summary) for an approved request."""
+    request_id = str(action_request["id"])
+    if not re.fullmatch(r"[0-9a-f-]{36}", request_id):
+        raise NonRetryableJobError("Action request ID is not a UUID")
+    if action_request.get("status") != "proposal_pending":
+        raise NonRetryableJobError("Action request is not approved and proposal_pending")
+    if action_request.get("capability") == "access_grant":
+        request, route, email = load_proposal_context_for(action_request)
+        return (f"aegis/access-request-{request_id}", f"infra/access-grants/{request_id}.tf",
+                render_gcp_access_hcl(request, route, email), f"Time-bound GCP access for `{email}`")
+    if action_request.get("capability") == "label_fix":
+        requester = user_email(action_request.get("requester_id"))
+        project = cloud_account(str(action_request["tenant_id"]))["project_id"]
+        content = render_label_fix(action_request, project, requester)
+        bucket = (action_request.get("resource") or {}).get("bucket")
+        return (f"aegis/label-fix-{request_id}", f"infra/label-fixes/{request_id}.json", content,
+                f"Add missing required labels to bucket `{bucket}`")
+    raise NonRetryableJobError("This capability does not produce a pull request")
+
+
+def create_github_proposal(action_request: dict[str, Any], branch: str, file_path: str, content: str,
+                           summary: str, change: dict[str, Any] | None = None) -> dict[str, Any]:
     repo, _, _, _ = github_config()
     token = github_installation_token()
     request_id = str(action_request["id"])
-    branch = f"aegis/access-request-{request_id}"
-    file_path = f"infra/access-grants/{request_id}.tf"
-    content = render_gcp_access_hcl(action_request, route, email)
     existing_pr = find_pull_request(repo, branch, token)
     if existing_pr:
         if existing_pr.get("state") == "closed" and not existing_pr.get("merged_at"):
@@ -318,32 +433,223 @@ def create_github_proposal(action_request: dict[str, Any], route: dict[str, Any]
     else:
         github_request(
             "PUT", f"/repos/{repo}/contents/{encoded_path}", token,
-            {"message": f"Aegis: approved access request {request_id}", "content": b64encode(content.encode()).decode(), "branch": branch},
+            {"message": f"Aegis: approved request {request_id}", "content": b64encode(content.encode()).decode(), "branch": branch},
         )
     pr = find_pull_request(repo, branch, token)
     if pr is None:
         justification = clean_pr_text(str(action_request.get("justification") or ""), 1500)
+        approval = ""
+        if change:
+            approval = (f"\n\nApproved in ServiceNow: [{change.get('change_number')}]({change.get('change_url')})"
+                        f" by {change.get('approver_email') or 'an approver'}.")
         pr = github_request(
             "POST", f"/repos/{repo}/pulls", token,
             {
-                "title": f"Aegis access request {request_id[:8]}", "head": branch, "base": "main",
-                "body": f"Governed access proposal for authenticated beneficiary `{email}`.\n\nJustification:\n{justification}\n\nThis PR requires protected-branch review and cannot be merged by Aegis.",
+                "title": f"Aegis request {request_id[:8]}: {clean_pr_text(summary, 80).replace('`', '')}",
+                "head": branch, "base": "main",
+                "body": f"{summary}.{approval}\n\nJustification:\n{justification}\n\nThis PR requires protected-branch review and cannot be merged by Aegis.",
             },
         )
     ref = github_request("GET", f"/repos/{repo}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}", token)
     return {"number": pr["number"], "url": pr["html_url"], "branch": branch, "commit_sha": ref["object"]["sha"], "file_path": file_path}
 
 
+def servicenow_reference(job: dict[str, Any]) -> dict[str, Any]:
+    runs = select("workflow_runs", f"select=external_references&id=eq.{job['workflow_run_id']}&limit=1")
+    return ((runs[0].get("external_references") or {}) if runs else {}).get("servicenow") or {}
+
+
 @register_handler("create_github_proposal")
 def handle_github_proposal(job: dict[str, Any]) -> None:
-    action_request, route, email = load_proposal_context(job)
-    proposal = create_github_proposal(action_request, route, email)
+    action_request = load_request(job)
+    branch, file_path, content, summary = proposal_files(action_request)
+    proposal = create_github_proposal(action_request, branch, file_path, content, summary, servicenow_reference(job))
     rpc("complete_github_proposal", {
         "p_job_id": job["id"], "p_worker_id": WORKER_ID, "p_pr_number": proposal["number"],
         "p_pr_url": proposal["url"], "p_branch": proposal["branch"], "p_commit_sha": proposal["commit_sha"],
         "p_file_path": proposal["file_path"],
     })
     LOGGER.info("github_proposal_complete job=%s request=%s pr=%s", job["id"], action_request["id"], proposal["number"])
+
+
+APPLY_WORKFLOW_FILE = "terraform-apply.yml"
+APPLY_JOB_NAMES = {"access_grant": "gcp-apply-access-grants", "label_fix": "gcp-apply-label-fixes"}
+PR_RECHECK_SECONDS = 60
+PIPELINE_RECHECK_SECONDS = 30
+PIPELINE_START_GRACE = timedelta(minutes=30)
+
+
+def load_github_reference(job: dict[str, Any]) -> dict[str, Any]:
+    runs = select("workflow_runs", f"select=external_references&id=eq.{job['workflow_run_id']}&limit=1")
+    github = ((runs[0].get("external_references") or {}) if runs else {}).get("github") or {}
+    number = github.get("pull_request_number")
+    if not isinstance(number, int) or number < 1:
+        raise NonRetryableJobError("Workflow run has no GitHub pull request reference")
+    return github
+
+
+def check_delivery(repo: str, token: str, pr_number: int, now: datetime,
+                   apply_job: str = "gcp-apply-access-grants") -> tuple[str, dict[str, Any], int]:
+    """Return (state, details, recheck_seconds) for a governed proposal PR.
+
+    States: pr_open, merged, applying (keep watching) or completed, failed,
+    cancelled (final). Aegis only reads GitHub here; it never merges.
+    """
+    pr = github_request("GET", f"/repos/{repo}/pulls/{pr_number}", token)
+    details: dict[str, Any] = {"pull_request_number": pr_number, "pull_request_url": pr.get("html_url")}
+    if not pr.get("merged_at"):
+        if pr.get("state") == "closed":
+            return "cancelled", {**details, "reason": "Pull request was closed without merging"}, 0
+        return "pr_open", details, PR_RECHECK_SECONDS
+
+    sha = str(pr.get("merge_commit_sha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise RuntimeError("Merged pull request has no merge commit yet")
+    merged_at = datetime.fromisoformat(str(pr["merged_at"]).replace("Z", "+00:00"))
+    details.update({"merged_at": pr["merged_at"], "merge_commit_sha": sha})
+
+    query = urllib.parse.urlencode({"head_sha": sha, "event": "push", "per_page": 5})
+    runs = github_request("GET", f"/repos/{repo}/actions/workflows/{APPLY_WORKFLOW_FILE}/runs?{query}", token)
+    workflow_runs = (runs or {}).get("workflow_runs") or []
+    if not workflow_runs:
+        if now - merged_at > PIPELINE_START_GRACE:
+            return "failed", {**details, "reason": "The apply pipeline did not start after the merge"}, 0
+        return "merged", details, PIPELINE_RECHECK_SECONDS
+
+    run = max(workflow_runs, key=lambda item: item.get("run_attempt") or 0)
+    details.update({"workflow_run_id": run.get("id"), "workflow_run_url": run.get("html_url")})
+    if run.get("status") != "completed":
+        return "applying", details, PIPELINE_RECHECK_SECONDS
+
+    jobs = github_request("GET", f"/repos/{repo}/actions/runs/{run['id']}/jobs?per_page=50", token)
+    job_result = next((item for item in (jobs or {}).get("jobs") or [] if item.get("name") == apply_job), None)
+    conclusion = (job_result or {}).get("conclusion")
+    details["apply_conclusion"] = conclusion
+    if conclusion == "success":
+        return "completed", details, 0
+    reason = (
+        "The apply step was skipped; check the pipeline's GCP settings"
+        if conclusion == "skipped"
+        else f"The apply step finished with: {conclusion or 'no result'}"
+    )
+    return "failed", {**details, "reason": reason}, 0
+
+
+@register_handler("track_github_delivery")
+def handle_delivery_tracking(job: dict[str, Any]) -> None:
+    action_request = load_request(job)
+    github = load_github_reference(job)
+    repo, _, _, _ = github_config()
+    apply_job = APPLY_JOB_NAMES.get(str(action_request.get("capability")))
+    if apply_job is None:
+        raise NonRetryableJobError("This capability has no apply pipeline to follow")
+    state, details, recheck = check_delivery(
+        repo, github_installation_token(), int(github["pull_request_number"]), datetime.now(timezone.utc), apply_job
+    )
+    if state == "completed" and action_request.get("capability") == "access_grant":
+        details["expires_at"] = access_expires_at(action_request)
+    if state in ("completed", "failed", "cancelled"):
+        note_servicenow_outcome(job, state, details)
+    rpc("record_github_delivery", {
+        "p_job_id": job["id"], "p_worker_id": WORKER_ID, "p_state": state,
+        "p_details": details, "p_recheck_seconds": recheck or PR_RECHECK_SECONDS,
+    })
+    LOGGER.info("delivery_checked job=%s request=%s state=%s", job["id"], action_request["id"], state)
+
+
+def note_servicenow_outcome(job: dict[str, Any], state: str, details: dict[str, Any]) -> None:
+    """Best effort: the change record shows how delivery ended. Never blocks delivery."""
+    change = servicenow_reference(job)
+    if not change.get("change_sys_id"):
+        return
+    lines = {
+        "completed": "Applied by the Aegis pipeline.",
+        "failed": f"Delivery failed: {details.get('reason', 'unknown reason')}.",
+        "cancelled": "The pull request was closed without merging; nothing was changed.",
+    }[state]
+    if details.get("pull_request_url"):
+        lines += f" Pull request: {details['pull_request_url']}"
+    if details.get("workflow_run_url"):
+        lines += f" Pipeline run: {details['workflow_run_url']}"
+    if details.get("expires_at"):
+        lines += f" Access ends automatically at {details['expires_at']}."
+    try:
+        servicenow.add_change_note(servicenow.ServiceNowConfig.from_env(), change["change_sys_id"], lines)
+    except Exception:
+        LOGGER.exception("servicenow_note_failed job=%s", job.get("id"))
+
+
+def describe_request(action_request: dict[str, Any], requester: str, project_id: str) -> tuple[str, str]:
+    resource = action_request.get("resource") or {}
+    decision = action_request.get("policy_decision") or {}
+    capability = action_request.get("capability")
+    if capability == "access_grant":
+        title = f"Aegis: {resource.get('tier')} GCP access for {requester} ({resource.get('ttl_hours')}h)"
+        what = (f"Grant {resource.get('tier')} access on GCP project {project_id} ({resource.get('environment')}) "
+                f"to {requester} for {resource.get('ttl_hours')} hours. GCP removes it automatically afterwards.")
+    else:
+        labels = ", ".join(decision.get("labels_to_add") or [])
+        title = f"Aegis: add missing labels to bucket {resource.get('bucket')}"
+        what = (f"Add the missing required labels ({labels}) to GCP bucket {resource.get('bucket')} in project {project_id}. "
+                "Existing labels are not changed.")
+    body = (f"{what}\n\nRequested by: {requester}\nJustification: {action_request.get('justification', '')}\n"
+            f"Policy: allowed ({', '.join(decision.get('policy_ids') or [])}), risk {decision.get('risk_level', 'unknown')}\n"
+            f"Aegis request: {action_request['id']}\n\n"
+            "Approving here lets Aegis open a pull request. A person must still merge it before anything changes.")
+    return title, body
+
+
+@register_handler("servicenow_approval")
+def handle_servicenow_approval(job: dict[str, Any]) -> None:
+    action_request = load_request(job)
+    config = servicenow.ServiceNowConfig.from_env()
+    requester = user_email(action_request.get("requester_id"))
+    project = cloud_account(str(action_request["tenant_id"]))["project_id"]
+    title, body = describe_request(action_request, requester, project)
+    change = servicenow.open_change_for_approval(config, request_id=str(action_request["id"]), requester_email=requester,
+                                                 short_description=title, description=body)
+    decision = servicenow.approval_decision(config, change["change_sys_id"], requester)
+    rpc("record_servicenow_approval", {
+        "p_job_id": job["id"], "p_worker_id": WORKER_ID, "p_state": decision["state"],
+        "p_details": {**change, "approver_email": decision["approver_email"], "decided_at": decision["decided_at"]},
+        "p_recheck_seconds": 30,
+    })
+    LOGGER.info("servicenow_approval job=%s request=%s change=%s state=%s",
+                job["id"], action_request["id"], change["change_number"], decision["state"])
+
+
+@register_handler("search_logs")
+def handle_log_search(job: dict[str, Any]) -> None:
+    action_request = load_request(job)
+    resource = action_request.get("resource") or {}
+    project = cloud_account(str(action_request["tenant_id"]))["project_id"]
+    hint = str(resource.get("resource_hint") or "")
+    hours = resource.get("time_window_hours")
+    findings = gcp.search_logs(project, hint, hours)
+    rpc("record_log_search", {
+        "p_job_id": job["id"], "p_worker_id": WORKER_ID,
+        "p_summary": gcp.summarize_findings(findings, hint, hours), "p_findings": findings,
+    })
+    LOGGER.info("log_search job=%s request=%s findings=%s", job["id"], action_request["id"], len(findings))
+
+
+@register_handler("create_servicenow_incident")
+def handle_servicenow_incident(job: dict[str, Any]) -> None:
+    action_request = load_request(job)
+    runs = select("workflow_runs", f"select=external_references&id=eq.{job['workflow_run_id']}&limit=1")
+    triage = ((runs[0].get("external_references") or {}) if runs else {}).get("triage") or {}
+    resource = action_request.get("resource") or {}
+    requester = user_email(action_request.get("requester_id"))
+    project = cloud_account(str(action_request["tenant_id"]))["project_id"]
+    incident = servicenow.open_incident(
+        servicenow.ServiceNowConfig.from_env(), request_id=str(action_request["id"]),
+        short_description=f"Aegis triage: {resource.get('resource_hint')} on GCP {project}",
+        description=(f"Raised by {requester} through Aegis.\nJustification: {action_request.get('justification', '')}\n"
+                     f"Search: last {resource.get('time_window_hours')} hours, warnings and above.\n\n"
+                     f"Findings: {triage.get('summary', 'none recorded')}"),
+    )
+    rpc("record_servicenow_incident", {"p_job_id": job["id"], "p_worker_id": WORKER_ID, "p_details": incident})
+    LOGGER.info("servicenow_incident job=%s request=%s incident=%s", job["id"], action_request["id"], incident["incident_number"])
 
 
 class LeaseHeartbeat(AbstractContextManager["LeaseHeartbeat"]):
@@ -388,19 +694,107 @@ def error_code(exc: Exception) -> str:
     return re.sub(r"[^a-z0-9_]+", "_", name)[:64] or "worker_error"
 
 
+def is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, NonRetryableJobError):
+        return False
+    return bool(getattr(exc, "retryable", True))
+
+
 def persist_failure(job: dict[str, Any], exc: Exception) -> None:
     rpc("fail_workflow_job", {
         "p_job_id": job["id"],
         "p_worker_id": WORKER_ID,
         "p_error": str(exc),
         "p_error_code": error_code(exc),
-        "p_retryable": not isinstance(exc, NonRetryableJobError),
+        "p_retryable": is_retryable(exc),
     })
+
+
+def insert(table: str, row: dict[str, Any]) -> None:
+    request_json(f"{SUPABASE_URL}/rest/v1/{table}", method="POST", body=row, supabase=True)
+
+
+def refresh_snapshots(now: datetime | None = None) -> None:
+    """Record label compliance (and cost, once billing export exists) per workspace."""
+    now = now or datetime.now(timezone.utc)
+    for account in select("tenant_cloud_accounts", "select=tenant_id,project_id,billing_table&cloud=eq.gcp&enabled=eq.true"):
+        tenant, project = account["tenant_id"], account["project_id"]
+        try:
+            buckets = gcp.list_buckets(project)
+            items = [{"bucket": b["name"], "location": b["location"], "labels": b["labels"],
+                      "missing": gcp.missing_labels(b["labels"])} for b in buckets]
+            insert("cloud_snapshots", {"tenant_id": tenant, "kind": "label_compliance", "project_id": project, "data": {
+                "required": list(gcp.REQUIRED_LABELS), "buckets": items,
+                "compliant": sum(1 for item in items if not item["missing"]), "total": len(items)}})
+        except Exception:
+            LOGGER.exception("label_snapshot_failed tenant=%s", tenant)
+        if not account.get("billing_table"):
+            continue
+        month = now.strftime("%Y%m")
+        try:
+            rows = gcp.cost_by_cost_center(project, account["billing_table"], month)
+            total = round(sum(float(row["net_cost"] or 0) for row in rows), 2)
+            untagged = round(sum(float(row["net_cost"] or 0) for row in rows if not row["cost_center"]), 2)
+            insert("cloud_snapshots", {"tenant_id": tenant, "kind": "cost", "project_id": project, "data": {
+                "month": month, "currency": next((row["currency"] for row in rows if row.get("currency")), None),
+                "total": total, "untagged": untagged, "rows": rows}})
+        except Exception:
+            LOGGER.exception("cost_snapshot_failed tenant=%s", tenant)
+
+
+def export_audit_events() -> int:
+    """Copy new audit events to Cloud Logging (`aegis-audit`) for SIEM ingestion."""
+    exported = 0
+    for account in select("tenant_cloud_accounts", "select=tenant_id,project_id&cloud=eq.gcp&enabled=eq.true"):
+        tenant = account["tenant_id"]
+        state = select("audit_export_state", f"select=last_event_id&tenant_id=eq.{tenant}&limit=1")
+        last = int(state[0]["last_event_id"]) if state else 0
+        events = select("audit_events", "select=id,tenant_id,actor_id,action,object_type,object_id,correlation_id,metadata,occurred_at"
+                                        f"&tenant_id=eq.{tenant}&id=gt.{last}&order=id.asc&limit=200")
+        if not events:
+            continue
+        gcp.write_audit_entries(account["project_id"], events)
+        newest = events[-1]["id"]
+        request_json(f"{SUPABASE_URL}/rest/v1/audit_export_state?on_conflict=tenant_id", method="POST",
+                     body={"tenant_id": tenant, "last_event_id": newest, "updated_at": datetime.now(timezone.utc).isoformat()},
+                     supabase=True, extra_headers={"Prefer": "resolution=merge-duplicates"})
+        exported += len(events)
+    return exported
+
+
+class Every:
+    def __init__(self, seconds: float):
+        self.seconds = seconds
+        self.next_at = 0.0
+
+    def due(self, now: float) -> bool:
+        if now < self.next_at:
+            return False
+        self.next_at = now + self.seconds
+        return True
+
+
+def run_periodic(snapshots: "Every", audit: "Every") -> None:
+    now = time.monotonic()
+    if snapshots.due(now):
+        try:
+            refresh_snapshots()
+        except Exception:
+            LOGGER.exception("snapshots_failed")
+    if audit.due(now):
+        try:
+            count = export_audit_events()
+            if count:
+                LOGGER.info("audit_exported events=%s", count)
+        except Exception:
+            LOGGER.exception("audit_export_failed")
 
 
 def run() -> None:
     LOGGER.info("worker_started worker_id=%s job_types=%s", WORKER_ID, ",".join(registered_job_types()))
+    snapshots, audit = Every(SNAPSHOT_SECONDS), Every(AUDIT_EXPORT_SECONDS)
     while True:
+        run_periodic(snapshots, audit)
         try:
             jobs = rpc("claim_workflow_jobs", {
                 "p_worker_id": WORKER_ID,
@@ -427,5 +821,29 @@ def run() -> None:
             time.sleep(POLL_SECONDS)
 
 
+def start_health_server() -> None:
+    """Cloud Run requires an HTTP port; answer health checks only."""
+    port = os.getenv("PORT")
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Health(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib name
+            body = json.dumps({"status": "ok", "worker_id": WORKER_ID, "job_types": registered_job_types()}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: Any) -> None:
+            return
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), Health)
+    threading.Thread(target=server.serve_forever, name="health", daemon=True).start()
+
+
 if __name__ == "__main__":
+    start_health_server()
     run()

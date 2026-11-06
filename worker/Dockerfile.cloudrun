@@ -1,0 +1,17 @@
+# Aegis worker for Cloud Run. Runs as its own GCP service account (no key);
+# secrets arrive as environment variables from Secret Manager.
+FROM openpolicyagent/opa:1.8.0-static AS opa
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY --from=opa /opa /usr/local/bin/opa
+RUN pip install --no-cache-dir "PyJWT[crypto]==2.15.0" "google-auth==2.58.1" "requests==2.32.3"
+COPY policy /policies
+COPY worker/worker.py worker/gcp.py worker/servicenow.py /app/
+COPY worker/cloudrun-entrypoint.sh /usr/local/bin/aegis-entrypoint
+RUN rm -f /policies/*_test.rego \
+    && chmod 0555 /usr/local/bin/aegis-entrypoint \
+    && useradd --system --uid 10001 aegis
+USER aegis
+ENV OPA_URL=http://127.0.0.1:8181 PYTHONUNBUFFERED=1
+ENTRYPOINT ["/usr/local/bin/aegis-entrypoint"]

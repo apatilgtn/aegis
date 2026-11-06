@@ -1,10 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 128" role="img" aria-labelledby="title desc">
   <title id="title">Aegis Engineering Control Plane</title><desc id="desc">Aegis shield logo and wordmark.</desc>
-  <defs>
-    <linearGradient id="edge" x1="18" y1="8" x2="108" y2="120" gradientUnits="userSpaceOnUse"><stop stop-color="#B8FFD9"/><stop offset=".48" stop-color="#80F5BE"/><stop offset="1" stop-color="#37DC92"/></linearGradient>
-    <linearGradient id="core" x1="70" y1="31" x2="48" y2="96" gradientUnits="userSpaceOnUse"><stop stop-color="#F2FFF8"/><stop offset="1" stop-color="#80F5BE"/></linearGradient>
-  </defs>
-  <g transform="translate(5 5) scale(.92)"><path d="M64 7 111 25v34c0 29-18.8 52.4-47 63C35.8 111.4 17 88 17 59V25L64 7Z" fill="#0B1110" stroke="url(#edge)" stroke-width="6" stroke-linejoin="round"/><path d="M64 27 91 86H79.5l-6-13H51.8l-6.1 13H34L64 27Zm0 21.6-7.8 15.9h15.3L64 48.6Z" fill="url(#edge)"/><path d="m72 35-20 32h14l-8 27 22-35H66l6-24Z" fill="url(#core)"/></g>
-  <text x="145" y="72" fill="#F2F5F2" font-family="Arial,Helvetica,sans-serif" font-size="58" font-weight="700" letter-spacing="8">AEGIS</text>
-  <text x="149" y="101" fill="#80F5BE" font-family="Arial,Helvetica,sans-serif" font-size="13" font-weight="700" letter-spacing="4.2">ENGINEERING CONTROL PLANE</text>
+  <g transform="translate(8 8) scale(.88)">
+    <rect width="128" height="128" rx="28" fill="#0F1115"/>
+    <path d="M64 16 104 31v29c0 24.8-16.1 44.8-40 53.8C40.1 104.8 24 84.8 24 60V31L64 16Z" fill="#181B22" stroke="#FFFFFF" stroke-width="5.5" stroke-linejoin="round"/>
+    <path d="M64 33 87 83H77.2l-5.1-11H55.9l-5.2 11H41L64 33Zm0 18.4-6.6 13.5h13L64 51.4Z" fill="#FFFFFF"/>
+  </g>
+  <text x="145" y="72" fill="#0F1115" font-family="Arial,Helvetica,sans-serif" font-size="56" font-weight="800" letter-spacing="6">AEGIS</text>
+  <text x="148" y="101" fill="#52525B" font-family="Arial,Helvetica,sans-serif" font-size="13" font-weight="700" letter-spacing="4">ENGINEERING CONTROL PLANE</text>
 </svg>

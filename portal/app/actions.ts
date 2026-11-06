@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
+import { chat, draftRequest, nvidiaConfigured, type RequestDraft } from "@/lib/nvidia";
 
 export type ActionState = {
   ok: boolean;
@@ -14,6 +15,7 @@ export type AegisAnswerState = {
   message: string;
   answer: string;
   evidence: string[];
+  draft?: RequestDraft;
 };
 
 const initialError = (message: string): ActionState => ({ ok: false, message });
@@ -78,6 +80,24 @@ export async function createAccessRequest(
 
   if (serviceError || !service) return initialError("That service is not available in your workspace.");
 
+  const { data: route, error: routeError } = await context.supabase
+    .from("service_entitlements")
+    .select("max_ttl_hours")
+    .eq("tenant_id", context.membership.tenant_id)
+    .eq("service_id", service.id)
+    .eq("cloud", cloud)
+    .eq("environment", environment)
+    .eq("tier", tier)
+    .eq("enabled", true)
+    .maybeSingle();
+
+  if (routeError || !route) {
+    return initialError("That access level is not offered for this service. Pick one of the listed options.");
+  }
+  if (ttlHours > route.max_ttl_hours) {
+    return initialError(`This access level can be requested for at most ${route.max_ttl_hours} hours.`);
+  }
+
   const { data: request, error } = await context.supabase
     .from("action_requests")
     .insert({
@@ -108,51 +128,113 @@ export async function createAccessRequest(
   return { ok: true, message: "Request submitted for policy evaluation.", createdId: request.id };
 }
 
-export async function decideAccessRequest(
-  _previousState: ActionState,
-  formData: FormData,
+const SAFE_HINT = /^[A-Za-z0-9 ._:/@-]{2,120}$/;
+const BUCKET_NAME = /^[a-z0-9][a-z0-9._-]{1,220}[a-z0-9]$/;
+const COST_CENTER = /^[a-z0-9][a-z0-9_-]{1,62}$/;
+const SEARCH_WINDOWS = [1, 4, 24, 72, 168];
+
+async function governingService(context: Exclude<Awaited<ReturnType<typeof authenticatedContext>>, { error: string }>) {
+  const { data } = await context.supabase
+    .from("services")
+    .select("id,slug")
+    .eq("tenant_id", context.membership.tenant_id)
+    .order("created_at")
+    .limit(1)
+    .maybeSingle();
+  return data;
+}
+
+async function insertRequest(
+  context: Exclude<Awaited<ReturnType<typeof authenticatedContext>>, { error: string }>,
+  capability: "incident_triage" | "label_fix",
+  justification: string,
+  resource: Record<string, unknown>,
 ): Promise<ActionState> {
+  const service = await governingService(context);
+  const { data: request, error } = await context.supabase
+    .from("action_requests")
+    .insert({
+      tenant_id: context.membership.tenant_id,
+      requester_id: context.userId,
+      beneficiary_id: context.userId,
+      service_id: service?.id ?? null,
+      capability,
+      justification,
+      status: "awaiting_policy",
+      risk_level: "unknown",
+      resource,
+      idempotency_key: crypto.randomUUID(),
+      submitted_at: new Date().toISOString(),
+    })
+    .select("id")
+    .single();
+  if (error) return initialError(error.message);
+  revalidatePath("/");
+  return { ok: true, message: "Submitted. Aegis is checking it against policy now.", createdId: request.id };
+}
+
+export async function createIncidentTriage(_previousState: ActionState, formData: FormData): Promise<ActionState> {
   const context = await authenticatedContext();
   if ("error" in context) return initialError(context.error ?? "Authentication failed.");
-  if (!["approver", "platform_admin"].includes(context.membership.role)) {
-    return initialError("Your role cannot approve requests.");
+  const hint = String(formData.get("resourceHint") ?? "").trim();
+  const hours = Number(formData.get("timeWindowHours"));
+  const justification = String(formData.get("justification") ?? "").trim();
+  if (!SAFE_HINT.test(hint)) {
+    return initialError("Name the service or resource using letters, numbers, spaces, '.', '_', '-', ':', '/' or '@' (2–120 characters).");
   }
-
-  const requestId = String(formData.get("requestId") ?? "").trim();
-  const decision = String(formData.get("decision") ?? "").trim();
-  const reason = String(formData.get("reason") ?? "").trim();
-
-  if (!requestId || !["approved", "rejected"].includes(decision)) {
-    return initialError("Choose a valid request and decision.");
+  if (!SEARCH_WINDOWS.includes(hours)) return initialError("Choose one of the listed time windows.");
+  if (justification.length < 10 || justification.length > 2000) {
+    return initialError("Describe the problem in 10 to 2,000 characters.");
   }
-  if (decision === "rejected" && reason.length < 5) {
-    return initialError("Add a short reason when rejecting a request.");
-  }
-
-  const { data: request, error: requestError } = await context.supabase
-    .from("action_requests")
-    .select("id,requester_id,beneficiary_id,status,tenant_id")
-    .eq("id", requestId)
-    .eq("tenant_id", context.membership.tenant_id)
-    .maybeSingle();
-
-  if (requestError || !request) return initialError("Request not found.");
-  if (request.requester_id === context.userId || request.beneficiary_id === context.userId) {
-    return initialError("Separation of duties prevents you from approving your own request.");
-  }
-
-  const { error } = await context.supabase.from("approvals").insert({
-    tenant_id: context.membership.tenant_id,
-    action_request_id: request.id,
-    approver_id: context.userId,
-    decision,
-    reason: reason || null,
+  return insertRequest(context, "incident_triage", justification, {
+    cloud: "gcp",
+    resource_hint: hint,
+    time_window_hours: hours,
   });
+}
 
+export async function createLabelFix(_previousState: ActionState, formData: FormData): Promise<ActionState> {
+  const context = await authenticatedContext();
+  if ("error" in context) return initialError(context.error ?? "Authentication failed.");
+  const bucket = String(formData.get("bucket") ?? "").trim();
+  const costCenter = String(formData.get("costCenter") ?? "").trim().toLowerCase();
+  const justification = String(formData.get("justification") ?? "").trim();
+  if (!BUCKET_NAME.test(bucket)) return initialError("Choose a bucket from the list.");
+  if (!COST_CENTER.test(costCenter)) {
+    return initialError("Cost center must be 2–63 lowercase letters, numbers, '_' or '-' (for example pmt-01).");
+  }
+  if (justification.length < 10 || justification.length > 2000) {
+    return initialError("Justification must be between 10 and 2,000 characters.");
+  }
+  const { data: account } = await context.supabase
+    .from("tenant_cloud_accounts")
+    .select("environment")
+    .eq("tenant_id", context.membership.tenant_id)
+    .eq("enabled", true)
+    .limit(1)
+    .maybeSingle();
+  if (!account) return initialError("This workspace has no GCP project connected yet.");
+  return insertRequest(context, "label_fix", justification, {
+    cloud: "gcp",
+    environment: account.environment,
+    bucket,
+    cost_center: costCenter,
+  });
+}
+
+export async function decideIncident(_previousState: ActionState, formData: FormData): Promise<ActionState> {
+  const context = await authenticatedContext();
+  if ("error" in context) return initialError(context.error ?? "Authentication failed.");
+  const requestId = String(formData.get("requestId") ?? "");
+  const raise = String(formData.get("decision") ?? "") === "raise";
+  if (!/^[0-9a-f-]{36}$/.test(requestId)) return initialError("That request could not be found.");
+  const { error } = await context.supabase.rpc("decide_incident", { p_request_id: requestId, p_raise: raise });
   if (error) return initialError(error.message);
-
   revalidatePath("/");
-  return { ok: true, message: decision === "approved" ? "Request approved." : "Request rejected." };
+  return {
+    ok: true,
+    message: raise ? "Raising the incident in ServiceNow now." : "Closed without raising an incident.",
+  };
 }
 
 export async function createService(
@@ -256,6 +338,51 @@ export async function askAegis(
   const latest = requests[0];
   let answer: string;
   let evidence: string[];
+
+  if (nvidiaConfigured()) {
+    try {
+      const [{ data: labelSnapshot }, { data: costSnapshot }] = await Promise.all([
+        context.supabase.from("cloud_snapshots").select("captured_at,data").eq("tenant_id", tenantId).eq("kind", "label_compliance")
+          .order("captured_at", { ascending: false }).limit(1).maybeSingle(),
+        context.supabase.from("cloud_snapshots").select("captured_at,data").eq("tenant_id", tenantId).eq("kind", "cost")
+          .order("captured_at", { ascending: false }).limit(1).maybeSingle(),
+      ]);
+      const labelData = (labelSnapshot?.data ?? null) as { buckets?: { bucket: string; missing: string[] }[] } | null;
+      const buckets = (labelData?.buckets ?? []).filter((item) => item.missing.length).map((item) => item.bucket);
+      const draft = await draftRequest(question, buckets);
+      if (draft.capability !== "unknown") {
+        return {
+          ok: true,
+          message: "Draft ready — check it before submitting",
+          answer: "This looks like a request. Open the prepared form, check every field, then submit it yourself.",
+          evidence: ["NVIDIA model draft", "form validation and policy still apply"],
+          draft,
+        };
+      }
+      const workspace = {
+        services: services.map((service) => ({ name: service.name, lifecycle: service.lifecycle, tier: service.tier })),
+        requests: requests.slice(0, 30).map((request) => ({
+          status: request.status, risk: request.risk_level, created_at: request.created_at,
+          resource: request.resource,
+        })),
+        recent_events: events.slice(0, 30).map((event) => ({ type: event.event_type, at: event.occurred_at })),
+        label_compliance: labelData,
+        cost: costSnapshot?.data ?? null,
+      };
+      const answer = await chat([
+        {
+          role: "system",
+          content:
+            "You are Aegis, a cloud governance assistant. Answer only from the WORKSPACE JSON. If the answer is not in it, say so. " +
+            "Use plain language, at most 120 words. Never claim you can approve, merge or change anything.",
+        },
+        { role: "user", content: `WORKSPACE:\n${JSON.stringify(workspace).slice(0, 12000)}\n\nQUESTION: ${question}` },
+      ]);
+      return { ok: true, message: "Answer from your live workspace", answer, evidence: ["services", "action_requests", "workflow_events", "cloud_snapshots"] };
+    } catch {
+      // Fall through to the rule-based answer if the model is unavailable.
+    }
+  }
 
   if (/approv|waiting|pending/.test(normalized)) {
     answer = awaitingApproval.length

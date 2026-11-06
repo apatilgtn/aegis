@@ -1,6 +1,6 @@
 terraform {
   backend "gcs" {
-    bucket = "aegis-tfstate-ual-demo-af168"
+    bucket = "aegis-tfstate-project-4f0a7dac-0503-4e87-abe"
     prefix = "terraform/state"
   }
 
@@ -13,6 +13,6 @@ terraform {
 }
 
 provider "google" {
-  project = "ual-demo-af168"
+  project = "project-4f0a7dac-0503-4e87-abe"
   region  = "us-central1"
 }

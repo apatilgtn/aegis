@@ -1,0 +1,12 @@
+# Only what the worker image needs is uploaded to Cloud Build.
+*
+!policy/
+!policy/**
+!worker/
+!worker/worker.py
+!worker/gcp.py
+!worker/servicenow.py
+!worker/cloudrun-entrypoint.sh
+!worker/Dockerfile.cloudrun
+!mcp_gateway/
+!mcp_gateway/**
