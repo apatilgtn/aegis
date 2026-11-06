@@ -30,7 +30,7 @@ export function LoginForm() {
           {pending ? <><LoaderCircle className="spin" size={16} /> Working…</> : <>{mode === "signin" ? "Sign in securely" : "Create account"}<ArrowRight size={16} /></>}
         </button>
       </form>
-      <div className="login-foot"><KeyRound size={14} /> Roles come from Aegis membership—not an email entered into a form.</div>
+      <div className="login-foot"><KeyRound size={14} /> Your role comes from your Aegis workspace membership, not from the email you type.</div>
     </div>
   );
 }

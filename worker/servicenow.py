@@ -127,13 +127,17 @@ def approver_group_members(config: ServiceNowConfig) -> list[dict[str, str]]:
 
 
 def open_change_for_approval(config: ServiceNowConfig, *, request_id: str, requester_email: str,
-                             short_description: str, description: str) -> dict[str, str]:
+                             short_description: str, description: str, revision: str | None = None, excluded_emails: list[str] | None = None) -> dict[str, str]:
     """Create (or find) the change request and one approval per approver.
 
     The requester is never added as an approver, so they cannot approve
     their own request inside ServiceNow either.
     """
     correlation_id = _correlation(request_id)
+    if revision:
+        if not re.fullmatch(r"[a-f0-9]{64}", revision):
+            raise ServiceNowError("Invalid plan revision", retryable=False)
+        correlation_id = f"aegis-plan:{request_id}:{revision[:32]}"
     change = _find(config, "change_request", correlation_id, "sys_id,number")
     if change is None:
         change = table(config, "POST", "change_request", query={"sysparm_fields": "sys_id,number"}, body={
@@ -149,7 +153,8 @@ def open_change_for_approval(config: ServiceNowConfig, *, request_id: str, reque
 
     existing = {row["approver"] for row in table(config, "GET", "sysapproval_approver", query={
         "sysparm_query": f"sysapproval={sys_id}", "sysparm_fields": "approver", "sysparm_limit": "50"}) or []}
-    approvers = [member for member in approver_group_members(config) if member["email"] != requester_email.lower()]
+    excluded = {requester_email.lower(), *((email or "").lower() for email in (excluded_emails or []))}
+    approvers = [member for member in approver_group_members(config) if member["email"] not in excluded]
     if not approvers:
         raise ServiceNowError("No approver other than the requester is available", retryable=False)
     for member in approvers:
@@ -176,13 +181,14 @@ def approval_decision(config: ServiceNowConfig, change_sys_id: str, requester_em
         "sysparm_query": f"sysapproval={change_sys_id}",
         "sysparm_fields": "state,approver.email,comments,sys_updated_on", "sysparm_limit": "50"}) or []
     requester = requester_email.lower()
+    allowed = {member["email"] for member in approver_group_members(config)}
     for row in rows:
         if row.get("state") == "rejected":
             return {"state": "rejected", "approver_email": (row.get("approver.email") or "").lower(),
                     "decided_at": row.get("sys_updated_on")}
     for row in rows:
         email = (row.get("approver.email") or "").lower()
-        if row.get("state") == "approved" and email and email != requester:
+        if row.get("state") == "approved" and email in allowed and email != requester:
             return {"state": "approved", "approver_email": email, "decided_at": row.get("sys_updated_on")}
     return {"state": "requested", "approver_email": None, "decided_at": None}
 

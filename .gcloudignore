@@ -6,7 +6,12 @@
 !worker/worker.py
 !worker/gcp.py
 !worker/servicenow.py
+!worker/governance.py
+!worker/plan_gate.py
 !worker/cloudrun-entrypoint.sh
 !worker/Dockerfile.cloudrun
 !mcp_gateway/
 !mcp_gateway/**
+worker/tests/
+**/__pycache__/
+**/*.pyc

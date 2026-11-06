@@ -2,9 +2,6 @@ name: Portal CI
 
 on:
   pull_request:
-    paths:
-      - "portal/**"
-      - ".github/workflows/portal-ci.yml"
   push:
     branches: [main]
     paths:
@@ -34,4 +31,5 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run build
+      - run: node --test tests/*.test.mjs
+      - run: npx next build --webpack

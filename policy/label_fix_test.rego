@@ -16,3 +16,7 @@ test_denies_bad_cost_center if not decision.allowed with input as {"request": ob
 test_denies_short_reason if not decision.allowed with input as {"request": object.union(valid, {"justification": "x"})}
 
 test_denies_when_nothing_is_missing if not decision.allowed with input as {"request": object.union(valid, {"labels_to_add": []})}
+
+test_allows_explicitly_authorized_production_labels if {
+ decision.allowed with input as {"request": object.union(valid, {"environment":"prod","production_authorized":true})}
+}

@@ -14,6 +14,7 @@ deny contains "only Google Cloud buckets can be fixed" if {
 
 deny contains "production resources are not changed through this capability" if {
   input.request.environment != "nonprod"
+  not object.get(input.request, "production_authorized", false)
 }
 
 deny contains "choose a bucket" if {
