@@ -139,10 +139,17 @@ def summarize_findings(findings: list[dict[str, str]], hint: str, hours: int) ->
 # --- Tag / label compliance: Cloud Storage ------------------------------------------------------
 
 def list_buckets(project_id: str) -> list[dict[str, Any]]:
-    result = _call("GET", "https://storage.googleapis.com/storage/v1/b?" + urllib.parse.urlencode(
-        {"project": _require_project(project_id), "fields": "items(name,labels,location)", "maxResults": 200}))
-    return [{"name": item["name"], "labels": item.get("labels") or {}, "location": item.get("location", "")}
-            for item in result.get("items") or []]
+    items = []
+    token = None
+    while True:
+        query = {"project": _require_project(project_id), "fields": "items(name,labels,location),nextPageToken", "maxResults": 200}
+        if token:
+            query["pageToken"] = token
+        result = _call("GET", "https://storage.googleapis.com/storage/v1/b?" + urllib.parse.urlencode(query))
+        items.extend({"name": item["name"], "labels": item.get("labels") or {}, "location": item.get("location", "")} for item in result.get("items") or [])
+        token = result.get("nextPageToken")
+        if not token:
+            return items
 
 
 def bucket_labels(bucket: str) -> dict[str, str]:
@@ -154,7 +161,7 @@ def bucket_labels(bucket: str) -> dict[str, str]:
 
 
 def missing_labels(labels: dict[str, str], required: tuple[str, ...] = REQUIRED_LABELS) -> list[str]:
-    return [key for key in required if not labels.get(key)]
+    return [key for key in required if key not in labels]
 
 
 def label_value(value: str) -> str:
@@ -212,3 +219,81 @@ def write_audit_entries(project_id: str, events: list[dict[str, Any]]) -> None:
             "jsonPayload": event,
         } for event in events],
     })
+
+
+def iam_policy(project_id: str, bucket: str | None = None) -> dict[str, Any]:
+    if bucket:
+        if not _BUCKET.fullmatch(bucket):
+            raise GcpError("Invalid bucket name", retryable=False)
+        return _call("GET", f"https://storage.googleapis.com/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/iam?optionsRequestedPolicyVersion=3")
+    return _call("POST", f"https://cloudresourcemanager.googleapis.com/v1/projects/{_require_project(project_id)}:getIamPolicy", {"options": {"requestedPolicyVersion": 3}})
+
+
+def resource_inventory(project_id: str) -> list[dict[str, Any]]:
+    assets = []
+    token = None
+    while True:
+        query = {"pageSize": 500}
+        if token:
+            query["pageToken"] = token
+        result = _call("GET", f"https://cloudasset.googleapis.com/v1/projects/{_require_project(project_id)}:searchAllResources?" + urllib.parse.urlencode(query))
+        assets.extend({"name": a.get("name"), "type": a.get("assetType"), "display_name": a.get("displayName"), "location": a.get("location"), "labels": a.get("labels") or {}, "state": a.get("state")} for a in result.get("results", []))
+        token = result.get("nextPageToken")
+        if not token:
+            return assets
+
+
+def related_change_events(project_id: str, hint: str, hours: int) -> list[dict[str, str]]:
+    if not isinstance(hours, int) or isinstance(hours, bool) or not 1 <= hours <= 168:
+        raise GcpError("Invalid investigation window", retryable=False)
+    if not hint or len(hint) > 120 or any(ord(c) < 32 for c in hint):
+        raise GcpError("Invalid resource hint", retryable=False)
+    project = _require_project(project_id)
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    literal = json.dumps(hint)
+    filter_ = f'logName={json.dumps("projects/" + project + "/logs/cloudaudit.googleapis.com%2Factivity")} AND timestamp>="{since}" AND (protoPayload.resourceName:{literal} OR resource.labels.service_name:{literal})'
+    result = _call("POST", "https://logging.googleapis.com/v2/entries:list", {"resourceNames": ["projects/" + project], "filter": filter_, "orderBy": "timestamp desc", "pageSize": 20})
+    return [{"timestamp": e.get("timestamp", ""), "method": str((e.get("protoPayload") or {}).get("methodName", ""))[:200], "resource": str((e.get("protoPayload") or {}).get("resourceName", ""))[:300], "service": str((e.get("protoPayload") or {}).get("serviceName", ""))[:100]} for e in result.get("entries", [])]
+
+
+def analyze_access(project_id: str, member: str, role: str, bucket: str | None = None) -> dict[str, Any]:
+    """Project-bounded native allow-policy evidence; never an authorization verdict."""
+    project_id = _require_project(project_id)
+    if not re.fullmatch(r'user:[^\s@]+@[^\s@]+', member) or not re.fullmatch(r'roles/[A-Za-z0-9_.]+', role):
+        raise GcpError('Invalid reviewed identity or role', retryable=False)
+    if bucket and not _BUCKET.fullmatch(bucket):
+        raise GcpError('Invalid reviewed bucket', retryable=False)
+    if bucket:
+        resource = '//storage.googleapis.com/buckets/' + bucket
+    else:
+        resource = '//cloudresourcemanager.googleapis.com/projects/' + project_id
+    query = {'analysisQuery.identitySelector.identity': member,
+             'analysisQuery.resourceSelector.fullResourceName': resource,
+             'analysisQuery.accessSelector.roles': role,
+             'analysisQuery.options.expandGroups': 'false',
+             'analysisQuery.options.expandRoles': 'true', 'executionTimeout': '10s'}
+    result = _call('GET', f'https://cloudasset.googleapis.com/v1/projects/{project_id}:analyzeIamPolicy?' + urllib.parse.urlencode(query))
+    analysis = result.get('mainAnalysis') or {}
+    if not isinstance(result.get('mainAnalysis'), dict) or not isinstance(analysis.get('analysisResults', []), list):
+        raise GcpError('Native analysis response was incomplete', retryable=False)
+    rows = analysis.get('analysisResults') or []
+    bindings = []
+    conditions = set()
+    for row in rows[:50]:
+        binding = row.get('iamBinding') or {}
+        for acl in row.get('accessControlLists') or []:
+            if binding.get('condition'):
+                conditions.add((acl.get('conditionEvaluation') or {}).get('evaluationValue', 'UNKNOWN'))
+        bindings.append({'attached_to': row.get('attachedResourceFullName'), 'role': binding.get('role'),
+                         'conditional': bool(binding.get('condition')), 'fully_explored': row.get('fullyExplored') is True})
+    errors = [str(e.get('code', 'UNKNOWN')) for e in analysis.get('nonCriticalErrors') or []]
+    complete = result.get('fullyExplored') is True and analysis.get('fullyExplored') is True
+    partial = not complete or bool(errors) or bool(conditions - {'TRUE', 'FALSE'}) or len(rows) > 50
+    return {'state': 'partial' if partial else 'available', 'fully_explored': complete, 'identity': member,
+            'role': role, 'resource': resource, 'binding_count': len(rows), 'bindings': bindings,
+            'condition_evaluations': sorted(conditions), 'error_codes': errors, 'truncated': len(rows) > 50,
+            'summary': f'Google returned {len(rows)} matching or potentially matching allow-policy bindings.',
+            'limitations': ['Current-state allow-policy query, not a simulation of the proposed grant.',
+                            'Query scope is this project; ancestor policies outside it are not analyzed.',
+                            'Group expansion, deny policies and principal access boundaries are not assessed.',
+                            'No matching result does not prove that the identity has no other access.']}

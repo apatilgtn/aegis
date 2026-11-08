@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -7,6 +8,29 @@ os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_SECRET_KEY", "test-secret")
 
 from worker import worker
+
+
+@pytest.fixture(autouse=True)
+def isolate_workflow_integrations(monkeypatch):
+    """Existing handler tests stub new governance reads; security rules have their own tests."""
+    account = {"project_id": "project-4f0a7dac-0503-4e87-abe", "environment": "nonprod"}
+    settings = {"writes_enabled": True, "proposals_paused": False, "executions_paused": False, "approval_ttl_minutes": 60, "revision": 1}
+    policy = {"enabled": True, "production_allowed": False, "max_ttl_hours": 72, "allowed_roles": ["roles/logging.viewer", "roles/storage.objectUser"]}
+    monkeypatch.setattr(worker, "governance_context", lambda r: (account, settings, policy, proposal_route()))
+    def read(table, query):
+        if table == "governance_settings": return [settings]
+        if table == "proposal_receipts": return []
+        if table == "tenant_cloud_accounts": return [account]
+        if table == "service_entitlements": return [proposal_route()]
+        raise AssertionError(f"Unexpected integration read: {table}")
+    monkeypatch.setattr(worker, "select", read)
+    monkeypatch.setattr(worker, "insert", lambda *a: None)
+    monkeypatch.setattr(worker, "upsert", lambda *a: None)
+    monkeypatch.setattr(worker.gcp, "related_change_events", lambda *a: [])
+    monkeypatch.setattr(worker, "source_health", lambda *a: None)
+    monkeypatch.setattr(worker, "refresh_inventory", lambda *a: None)
+    monkeypatch.setattr(worker, "verify_delivered_change", lambda *a: None)
+    monkeypatch.setattr(worker.gcp, "list_buckets", lambda project: [{"name": "team-exports", "labels": {}, "location": "US"}])
 
 
 class NoopHeartbeat:
@@ -22,8 +46,8 @@ class NoopHeartbeat:
 
 def test_policy_handler_is_registered():
     assert worker.registered_job_types() == [
-        "create_github_proposal", "create_servicenow_incident", "evaluate_policy",
-        "search_logs", "servicenow_approval", "track_github_delivery",
+        "analyze_access", "create_github_proposal", "create_servicenow_incident", "evaluate_policy",
+        "search_logs", "servicenow_approval", "track_github_delivery", "verify_change",
     ]
 
 
@@ -76,6 +100,7 @@ def proposal_request(**overrides):
         "id": "11111111-2222-3333-4444-555555555555",
         "tenant_id": "153810f1-c175-46a4-8636-74918d9b70c5",
         "requester_id": "22222222-3333-4444-5555-666666666666",
+        "service_id": "33333333-4444-5555-6666-777777777777",
         "capability": "access_grant",
         "status": "proposal_pending",
         "resource": {"cloud": "gcp", "environment": "nonprod", "tier": "tier1", "ttl_hours": 24},
@@ -88,7 +113,7 @@ def proposal_request(**overrides):
 
 def proposal_route(**overrides):
     route = {
-        "cloud": "gcp", "entitlement_type": "gcp_iam_binding", "target_identifier": "project-4f0a7dac-0503-4e87-abe",
+        "cloud": "gcp", "environment": "nonprod", "entitlement_type": "gcp_iam_binding", "target_identifier": "project-4f0a7dac-0503-4e87-abe",
         "role_identifier": "roles/logging.viewer", "terraform_module_source": "modules/gcp/iam_binding", "max_ttl_hours": 72,
     }
     route.update(overrides)
@@ -377,7 +402,7 @@ def test_proposal_requires_approval_first():
 
 
 def test_servicenow_approval_handler_reports_decision(monkeypatch):
-    request = proposal_request(status="awaiting_approval", policy_decision={"policy_ids": ["AEGIS-ACCESS-001"], "risk_level": "low"})
+    request = proposal_request(status="awaiting_approval", policy_decision={"policy_ids": ["AEGIS-ACCESS-001"], "risk_level": "low", "proposed_expires_at": (datetime.now(timezone.utc)+timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")})
     common(monkeypatch, request)
     calls = capture_rpc(monkeypatch)
     opened = {}

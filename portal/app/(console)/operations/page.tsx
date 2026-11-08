@@ -1,0 +1,12 @@
+import Link from "next/link";
+import { RetryReadButton } from "@/components/governance-controls";
+import { PageHead } from "@/components/ui";
+import { governanceState, operationalJobs, requireContext } from "@/lib/data";
+import { formatDate } from "@/lib/view";
+export default async function OperationsPage() {
+ const context = await requireContext();
+ if (!["platform_admin","auditor"].includes(context.role)) return <div className="workflow-empty"><h2>Operations access required</h2><p>Only administrators and auditors can view durable job details.</p></div>;
+ const [jobs, governance] = await Promise.all([operationalJobs(context), governanceState(context)]);
+ const terminal = jobs.filter(j => ["failed","dead_letter"].includes(j.status));
+ return <><PageHead title="Operations" lede="Durable workflow jobs, stalled work and controlled recovery. Retrying a read step never reruns an apply."><Link className="btn" href="/administration">Manage pause controls</Link></PageHead><div className="metric-strip"><div><span>Recent jobs</span><strong>{jobs.length}</strong><small>Latest 100</small></div><div><span>Failed / dead letter</span><strong>{terminal.length}</strong></div><div><span>Proposal processing</span><strong>{governance.settings?.proposals_paused ? "Paused" : "Running"}</strong></div><div><span>New executions</span><strong>{governance.settings?.executions_paused ? "Paused" : "Gated"}</strong></div></div><div className="table-scroll rows"><table className="table"><thead><tr><th>Step</th><th>State</th><th>Attempts</th><th>Last result</th><th>Updated</th><th>Recovery</th></tr></thead><tbody>{jobs.map(j => <tr key={j.id}><td><strong>{j.job_type.replaceAll("_"," ")}</strong><small className="mono muted block">{j.id.slice(0,8)}</small></td><td><span className={`badge ${["failed","dead_letter"].includes(j.status) ? "bad" : j.status === "succeeded" ? "good" : "info"}`}>{j.status}</span></td><td>{j.attempts}/{j.max_attempts}</td><td className="muted">{j.last_error ?? "—"}</td><td className="muted nowrap">{formatDate(j.updated_at)}</td><td>{context.role === "platform_admin" && ["failed","dead_letter"].includes(j.status) && ["search_logs","track_github_delivery","verify_change"].includes(j.job_type) ? <RetryReadButton job={j.id} /> : <span className="muted">{["failed","dead_letter"].includes(j.status) ? "Fresh request / manual investigation" : "—"}</span>}</td></tr>)}{!jobs.length && <tr><td colSpan={6}>No workflow jobs recorded.</td></tr>}</tbody></table></div></>;
+}

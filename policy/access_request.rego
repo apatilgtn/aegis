@@ -4,7 +4,7 @@ import rego.v1
 
 default allow := false
 
-valid_clouds := {"gcp", "azure"}
+valid_clouds := {"gcp"}
 valid_environments := {"nonprod", "prod"}
 max_ttl_by_tier := {"tier1": 72, "tier2": 24, "tier3": 8}
 
@@ -22,6 +22,7 @@ deny contains "access tier is not supported" if {
 
 deny contains "production access is not enabled in the current policy" if {
   input.request.environment == "prod"
+  not object.get(input.request, "production_authorized", false)
 }
 
 deny contains "justification must be at least 10 characters" if {
@@ -46,4 +47,15 @@ decision := {
   "reasons": sort([reason | deny[reason]]),
   "policy_ids": ["AEGIS-ACCESS-001", "AEGIS-TTL-001", "AEGIS-PROD-001"],
   "risk_level": risk_level,
+}
+
+
+deny contains "production duration exceeds the capability limit" if {
+ input.request.environment == "prod"
+ input.request.ttl_hours > object.get(input.request, "production_max_ttl", 1)
+}
+
+deny contains "production tier3 access is not supported" if {
+ input.request.environment == "prod"
+ input.request.tier == "tier3"
 }

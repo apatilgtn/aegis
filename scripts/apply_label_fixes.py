@@ -51,7 +51,7 @@ def main(directory: str = "infra/label-fixes", dry_run: bool = False) -> int:
     docs = [load(path) for path in files]  # validate everything before touching anything
     for doc in docs:
         existing = current_labels(doc["project"], doc["bucket"])
-        to_add = {k: v for k, v in sorted(doc["add_labels"].items()) if not existing.get(k)}
+        to_add = {k: v for k, v in sorted(doc["add_labels"].items()) if k not in existing}
         if not to_add:
             print(f"{doc['bucket']}: nothing to add (request {doc['action_request_id']})")
             continue
