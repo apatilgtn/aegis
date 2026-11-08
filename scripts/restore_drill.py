@@ -24,7 +24,7 @@ def identity(dsn):
     return connection_identity(parse_dsn(dsn))
 
 
-def fingerprint(dsn):
+def fingerprint(dsn,snapshot=None,table_names=TABLES):
     import psycopg2
     from psycopg2 import sql
     c=psycopg2.connect(dsn,sslmode='require',connect_timeout=15)
@@ -32,9 +32,10 @@ def fingerprint(dsn):
     try:
         tables={}
         with c.cursor() as cur:
+            if snapshot:cur.execute("set transaction snapshot %s",(snapshot,))
             cur.execute("set local statement_timeout='60s'")
-            for table in TABLES:
-                cur.execute(sql.SQL('select to_jsonb(t) from public.{} t order by to_jsonb(t)::text').format(sql.Identifier(table)))
+            for table in table_names:
+                cur.execute(sql.SQL('select to_jsonb(t) from public.{} t order by to_jsonb(t)::text collate "C"').format(sql.Identifier(table)))
                 digest=hashlib.sha256();count=0
                 while True:
                     rows=cur.fetchmany(500)
@@ -44,7 +45,7 @@ def fingerprint(dsn):
                 tables[table]={'rows':count,'sha256':digest.hexdigest()}
             cur.execute('select bool_and(not writes_enabled) from public.governance_settings')
             writes_disabled=cur.fetchone()[0] is True
-            cur.execute("select relname,relrowsecurity from pg_class join pg_namespace n on n.oid=relnamespace where n.nspname='public' and relname=any(%s)",(list(TABLES),))
+            cur.execute("select relname,relrowsecurity from pg_class join pg_namespace n on n.oid=relnamespace where n.nspname='public' and relname=any(%s)",(list(table_names),))
             rls=all(enabled for _,enabled in cur.fetchall())
         return {'schema':1,'captured_at':datetime.now(timezone.utc).isoformat(),'database_identity_sha256':identity(dsn),'tables':tables,'writes_disabled':writes_disabled,'rls_enabled':rls}
     finally:c.rollback();c.close()
@@ -52,7 +53,8 @@ def fingerprint(dsn):
 
 def compare(baseline,restored):
     if baseline['database_identity_sha256']==restored['database_identity_sha256']:raise ValueError('Restore target must be a different isolated database')
-    mismatches=[table for table in TABLES if baseline['tables'].get(table)!=restored['tables'].get(table)]
+    if not set(TABLES)<=set(baseline['tables']):raise ValueError('Baseline lacks required governance tables')
+    mismatches=[table for table in sorted(set(baseline['tables'])|set(restored['tables'])) if baseline['tables'].get(table)!=restored['tables'].get(table)]
     passed=not mismatches and restored['writes_disabled'] and restored['rls_enabled']
     return {'state':'passed' if passed else 'failed','mismatched_tables':mismatches,'writes_disabled':restored['writes_disabled'],'rls_enabled':restored['rls_enabled'],'target_identity_sha256':restored['database_identity_sha256'],'checked_at':restored['captured_at'],'limitations':['Validates restored data and RLS flags, not authentication, Secret Manager, GitHub, ServiceNow, or full application recovery.','Capture the manifest at the backup checkpoint with writers paused; a later capture is not a matching backup baseline.','RTO and RPO require independently recorded backup and recovery timestamps.']}
 

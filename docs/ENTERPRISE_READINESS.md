@@ -84,3 +84,24 @@ pipeline completion to first retained verified read-back afterward. Denied
 attempts and distinct requests with stale facts are separate measures. Recorded
 operator minutes are self-reported work, not savings. Time saved remains unknown
 until a validated manual-process baseline exists.
+
+## Automated local logical restore
+
+With explicit approval to copy the governance data to the operator's machine,
+run `python3 -m scripts.local_restore_drill --report /private/tmp/aegis-restore-report.json`.
+Use an official PostgreSQL 17 image; a digest-pinned Google Docker Hub mirror is
+also supported through `--image`. Docker and `psycopg2` are required.
+
+The runner exports a consistent read-only snapshot and fingerprints the same
+snapshot. It restores an explicit allowlist of 29 Aegis tables and their functions
+into a disposable Docker database, verifies offline networking/no published ports,
+compares every selected table, and checks nonmember RLS denial plus administrator
+inbox/metrics access. Only referenced auth identity IDs are restored; profile and
+authentication schemas are metadata-only. Unrelated applications, auth credentials,
+sessions and vaults are excluded. Temporary backup files and containers are removed
+before a successful report is emitted. The private report contains counts, hashes,
+timings and checks; do not commit it to a public repository.
+
+This is a logical governance-data restore drill. It does not establish managed
+Supabase PITR recovery, login restoration, application/secret failover, or an RTO
+service commitment. Those require a separate full-environment exercise.

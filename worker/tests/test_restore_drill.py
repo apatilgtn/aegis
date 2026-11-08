@@ -35,3 +35,26 @@ def test_changing_roles_or_pooler_host_cannot_disguise_source_database():
     direct={'host':'db.'+project+'.supabase.co','user':'postgres','dbname':'postgres'}
     assert connection_identity(pooled)==connection_identity(another_role)==connection_identity(direct)
     assert connection_identity({'host':'localhost','port':'5432','dbname':'a','user':'postgres'})==connection_identity({'host':'localhost','port':'5432','dbname':'a','user':'reader'})
+
+
+def test_local_backup_has_explicit_governance_scope_and_no_profile_data():
+    from scripts.local_restore_drill import APP_TABLES,backup_command
+    command=backup_command('postgres:17-alpine','/private/source.env','snapshot','export')
+    assert '--schema=public' not in command
+    assert '--exclude-table-data=public.profiles' in command
+    assert not any(value.startswith('--schema=') for value in command)
+    assert set(TABLES)<=set(APP_TABLES)
+    assert all('--table=public.'+table in command for table in APP_TABLES)
+
+
+@pytest.mark.parametrize('image',['unknown/postgres:17','postgres:latest','postgres:16','evil.example/postgres:17'])
+def test_source_credentials_are_not_given_to_arbitrary_images(image):
+    from scripts.local_restore_drill import validate_image
+    with pytest.raises(ValueError):validate_image(image)
+
+
+def test_restore_comparison_checks_additional_governance_tables_too():
+    source=baseline();source['tables']['workflow_jobs']={'rows':1,'sha256':'jobs'}
+    restored={**deepcopy(source),'database_identity_sha256':'isolated-target'}
+    restored['tables']['workflow_jobs']['sha256']='changed'
+    assert compare(source,restored)['state']=='failed'
