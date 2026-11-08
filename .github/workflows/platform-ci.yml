@@ -33,7 +33,7 @@ jobs:
       - run: python -m pip install --requirement requirements.lock
       - run: python -m pip check
       - run: python -m pytest -q
-      - run: python -m py_compile worker/worker.py worker/gcp.py worker/servicenow.py worker/governance.py worker/plan_gate.py worker/native_analysis.py mcp_gateway/server.py mcp_gateway/governed_requests.py scripts/p0_e2e.py scripts/apply_label_fixes.py scripts/pipeline_plan_gate.py scripts/label_plan.py scripts/check_gcp_readiness.py
+      - run: python -m py_compile worker/worker.py worker/gcp.py worker/servicenow.py worker/governance.py worker/plan_gate.py worker/native_analysis.py mcp_gateway/server.py mcp_gateway/governed_requests.py scripts/p0_e2e.py scripts/apply_label_fixes.py scripts/pipeline_plan_gate.py scripts/label_plan.py scripts/check_gcp_readiness.py scripts/pilot_executor_plan.py scripts/check_operational_health.py scripts/restore_drill.py scripts/local_restore_drill.py scripts/validate_assurance_db.py
 
   policy-and-compose:
     runs-on: ubuntu-latest

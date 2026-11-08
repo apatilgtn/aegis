@@ -1,0 +1,9 @@
+import {PageHead} from '@/components/ui';
+import {SuspendMember} from '@/components/review-controls';
+import {requireContext} from '@/lib/data';
+type Member={user_id:string;email:string;role:string;status:string};
+export default async function People(){
+ const c=await requireContext();if(!['platform_admin','auditor'].includes(c.role))return <PageHead title="Reviewer access required"/>;
+ const {data,error}=await c.supabase.rpc('workspace_members',{p_tenant:c.tenantId});if(error)throw new Error('Workspace identities unavailable');
+ return <><PageHead title="Identity lifecycle" lede="Review active membership and suspend workspace access with an audit trail."/><div className="alert warn">Suspension blocks workspace/API access and future execution checkpoints. It does not revoke existing GCP grants, sessions, or permissions elsewhere. Coordinate separately approved cloud revocation and identity-provider offboarding. Previously downloaded evidence cannot be recalled.</div><div className="table-scroll rows"><table className="table"><thead><tr><th>Identity</th><th>Role</th><th>Membership</th><th>Action</th></tr></thead><tbody>{((data??[]) as Member[]).map(m=><tr key={m.user_id}><td>{m.email}{m.user_id===c.userId?' · You':''}</td><td>{m.role.replaceAll('_',' ')}</td><td><span className={`badge ${m.status==='active'?'good':'warn'}`}>{m.status}</span></td><td>{c.role==='platform_admin'&&m.user_id!==c.userId&&m.status==='active'?<SuspendMember userId={m.user_id}/>:m.user_id===c.userId?'Self-suspension is blocked':'No action'}</td></tr>)}</tbody></table></div><section className="workflow-panel section"><h2>Offboarding completion checklist</h2><p className="muted">Suspend membership; review owned requests; separately revoke live cloud grants; disable the upstream identity; verify API/MCP denial; record the evidence. Automated SCIM provisioning and organization-wide session revocation are not implemented.</p></section></>;
+}

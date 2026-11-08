@@ -1,3 +1,4 @@
+import { MonitorControl, EffortControl } from "@/components/review-controls";
 import { RequestAssurance } from "@/components/request-assurance";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -44,8 +45,9 @@ export default async function RequestPage({ params }: { params: Promise<{ id: st
   const { id } = await params;
   const found = await getRequest(context, id);
   if (!found) notFound();
-  const { request, events, findings, verification, receipt, planApprovals, changeContext, executionChecks, nativeAssessments } = found;
+  const { monitor, request, events, findings, verification, receipt, planApprovals, changeContext, executionChecks, nativeAssessments } = found;
   const mine = request.requesterId === context.userId;
+  const operatorInitiated=events.find(e=>e.type==="request.submitted")?.payload.submission_origin==="authorized_operator";
 
   return (
     <>
@@ -79,6 +81,7 @@ export default async function RequestPage({ params }: { params: Promise<{ id: st
         </div>
       </div>
 
+      {operatorInitiated&&<div className="workflow-note" style={{marginBottom:20}}><p><strong>Operator-initiated request.</strong> A trusted deployment operator submitted this for the registered request owner. Human approvals are recorded separately and remain required.</p></div>}
       <div className="grid-main">
         <div style={{ display: "grid", gap: 16 }}>
           <div className="note">
@@ -128,6 +131,7 @@ export default async function RequestPage({ params }: { params: Promise<{ id: st
             <Timeline steps={stepsOf(request)} />
           </div>
 
+          {request.capability!=="incident_triage"&&<section className="workflow-panel section"><h2>Ongoing assurance and operator effort</h2><p className="muted">Read-only monitoring checks the approved binding or labels. It cannot detect all access paths or changes between polls.</p>{context.role==="platform_admin"&&request.status==="completed"&&(monitor||verification?.state==="verified")&&<MonitorControl requestId={request.id} enabled={monitor?.enabled??false} interval={monitor?.interval_minutes??15}/>}<Link className="link" href="/assurance">View observation history →</Link>{(mine||context.role==="platform_admin")&&<details className="section"><summary>Record hands-on operator time</summary><EffortControl requestId={request.id}/></details>}</section>}
           {request.capability!=="incident_triage"&&<RequestAssurance request={request} receipt={receipt} checks={executionChecks} plans={planApprovals} verification={verification} native={nativeAssessments[0]??null} canAnalyze={mine||["platform_admin","auditor"].includes(context.role)} admin={context.role==="platform_admin"} auditor={["platform_admin","auditor"].includes(context.role)}/>}
           <div className="card card-pad">
             <h3>Reason given</h3>

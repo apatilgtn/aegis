@@ -61,6 +61,12 @@ def _authorize(payload: dict[str, Any], worker: Any, observations: list) -> tupl
         tenant = request["tenant_id"]
         observation = {"tenant_id": request["tenant_id"], "action_request_id": request_id, "checks": []}
         observations.append(observation)
+        for identity in {request["requester_id"], request.get("beneficiary_id") or request["requester_id"]}:
+            membership = worker.select("tenant_memberships", f"tenant_id=eq.{request['tenant_id']}&user_id=eq.{identity}&status=eq.active&limit=1")
+            if not membership:
+                observation["checks"].append({"key": "active_membership", "label": "Active workspace identity", "state": "changed", "approved": identity, "current": "No active workspace membership"})
+                return 403, {"error": "Requester or beneficiary is no longer an active workspace member"}
+            observation["checks"].append({"key": "membership_" + identity, "label": "Active workspace identity", "state": "matched", "approved": identity, "current": "Active"})
         account, settings, policy, route = worker.governance_context(request)
         if account["project_id"] != payload.get("project_id"):
             return 403, {"error": "Project mismatch"}
@@ -80,7 +86,7 @@ def _authorize(payload: dict[str, Any], worker: Any, observations: list) -> tupl
         checks = worker.governance.compare_manifest(approved, current)
         checks.append({"key": "artifact", "label": "Source artifact", "state": "matched" if receipt["artifact_sha256"] == artifacts[request_id] else "changed", "approved": receipt["artifact_sha256"], "current": artifacts[request_id]})
         checks.append({"key": "approval_expiry", "label": "Approval window", "state": "expired" if datetime.fromisoformat(receipt["expires_at"].replace("Z", "+00:00")) <= now else "matched", "approved": receipt["expires_at"], "current": now.isoformat()})
-        observation["checks"] = checks
+        observation["checks"].extend(checks)
         manifests[request_id] = receipt["manifest_sha256"]
         if any(c["state"] != "matched" for c in checks):
             changed = ", ".join(c["label"] for c in checks if c["state"] != "matched")

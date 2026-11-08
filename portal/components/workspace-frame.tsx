@@ -6,14 +6,18 @@ import { useState } from "react";
 import { Activity, ArrowUpRight, Blocks, ChartNoAxesCombined, ClipboardList, Fingerprint, LayoutDashboard, Menu, ShieldCheck, SlidersHorizontal, Sparkles, Plug, Radio, Workflow, X } from "lucide-react";
 
 const NAV = [
-  { href: "/", label: "Overview", icon: LayoutDashboard, group: "Workspace" },
-  { href: "/review", label: "Change review", icon: Workflow, group: "Workspace" },
+  { href: "/overview", label: "Overview", icon: LayoutDashboard, group: "Workspace" },
+  { href: "/inbox", label: "Reviewer inbox", icon: ClipboardList, group: "Workspace" },
+  { href: "/review", label: "Plan analysis", icon: Workflow, group: "Workspace" },
   { href: "/requests", label: "Requests", icon: ClipboardList, group: "Workspace" },
   { href: "/access", label: "My access", icon: Fingerprint, group: "Workspace" },
   { href: "/inventory", label: "Resource inventory", icon: Blocks, group: "Governance" },
   { href: "/investigations", label: "Investigations", icon: Radio, group: "Workspace" },
   { href: "/labels", label: "Label compliance", icon: ShieldCheck, group: "Governance" },
   { href: "/cost", label: "Cost insights", icon: ChartNoAxesCombined, group: "Governance" },
+  { href: "/assurance", label: "Continuous assurance", icon: ShieldCheck, group: "Governance" },
+  { href: "/value", label: "Workflow value", icon: ChartNoAxesCombined, group: "Governance" },
+  { href: "/people", label: "Identity lifecycle", icon: Fingerprint, group: "Platform" },
   { href: "/audit", label: "Audit log", icon: Activity, group: "Governance" },
   { href: "/services", label: "Service catalog", icon: Blocks, group: "Platform" },
   { href: "/operations", label: "Operations", icon: Activity, group: "Platform" },
@@ -50,7 +54,8 @@ export function WorkspaceFrame({ children, tenantName, openCount = 0, overviewHr
           <div className="workspace-switch"><span className="workspace-initial">{tenantName.slice(0, 1).toUpperCase()}</span><span><strong>{tenantName}</strong><small>Governed workspace</small></span></div>
           {actions && <div className="sidebar-actions">{actions}</div>}
           <nav className="sidebar-nav" aria-label="Main navigation">
-            {["Workspace", "Governance", "Platform"].map((group) => <div className="sidebar-group" key={group}><span className="sidebar-group-label">{group}</span>{NAV.filter((item) => item.group === group).map(({ href, label, icon: Icon }) => <Link key={href} href={href === "/" ? overviewHref : href === "/review" && overviewHref !== "/" ? `${overviewHref}?mode=review` : href} className={active(href) ? "active" : ""} aria-current={active(href) ? "page" : undefined} onClick={() => setExpandedAt(null)}><Icon size={18} strokeWidth={1.7} /><span>{label}</span>{href === "/requests" && openCount > 0 && <em>{openCount}</em>}</Link>)}</div>)}
+            <div className="sidebar-group"><span className="sidebar-group-label">Daily work</span>{NAV.filter(item=>["/inbox","/requests","/access","/assurance","/value"].includes(item.href)).map(({href,label,icon:Icon})=><Link key={href} href={href} className={active(href)?"active":""} aria-current={active(href)?"page":undefined} onClick={()=>setExpandedAt(null)}><Icon size={18} strokeWidth={1.7}/><span>{label}</span>{href==="/requests"&&openCount>0&&<em>{openCount}</em>}</Link>)}</div>
+            <details className="sidebar-tools" open={NAV.some(item=>!["/inbox","/requests","/access","/assurance","/value"].includes(item.href)&&active(item.href))}><summary>Cloud & platform tools</summary>{["Workspace","Governance","Platform"].map(group=>{const items=NAV.filter(item=>item.group===group&&!["/inbox","/requests","/access","/assurance","/value"].includes(item.href));return <div className="sidebar-group" key={group}><span className="sidebar-group-label">{group}</span>{items.map(({href,label,icon:Icon})=><Link key={href} href={href==="/overview"&&overviewHref!=="/"?overviewHref:href==="/review"&&overviewHref!=="/"?`${overviewHref}?mode=review`:href} className={active(href)?"active":""} aria-current={active(href)?"page":undefined} onClick={()=>setExpandedAt(null)}><Icon size={18} strokeWidth={1.7}/><span>{label}</span>{href==="/requests"&&openCount>0&&<em>{openCount}</em>}</Link>)}</div>;})}</details>
           </nav>
           <div className="sidebar-bottom">
             {onAsk && <button className="sidebar-assistant" onClick={onAsk}><span className="assistant-icon"><Sparkles size={18} /></span><span><strong>Ask Aegis</strong><small>A little help, grounded in data</small></span><ArrowUpRight size={15} /></button>}

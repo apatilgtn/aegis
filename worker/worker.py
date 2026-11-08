@@ -985,6 +985,10 @@ def run_periodic(snapshots: "Every", audit: "Every") -> None:
             LOGGER.exception("snapshots_failed")
     if audit.due(now):
         try:
+            rpc("schedule_assurance_checks", {})
+        except Exception:
+            LOGGER.exception("assurance_scheduler_failed")
+        try:
             count = export_audit_events()
             if count:
                 LOGGER.info("audit_exported events=%s", count)

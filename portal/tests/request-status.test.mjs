@@ -34,3 +34,6 @@ test('overview never draws a live grant span from delivery success alone',()=>{
  const verified=journey.segmentsOf({...request,verification:{state:'verified',checkedAt:'2026-11-08T05:30:00Z'}},events,now).find(s=>s.stage==='live');
  assert.equal(verified.start,new Date('2026-11-08T05:30:00Z').getTime());
 });
+test('approval dates display an explicit stable timezone',()=>{
+ assert.match(api.formatDate('2026-11-08T12:00:00Z'),/12:00 pm UTC$/);
+});
