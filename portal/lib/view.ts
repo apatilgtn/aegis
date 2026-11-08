@@ -201,7 +201,7 @@ function policyStep(request: RequestView): Step {
 
 export function formatDate(value: string | null | undefined) {
   if (!value) return "";
-  return new Date(value).toLocaleString("en-AU", { dateStyle: "medium", timeStyle: "short" });
+  return new Date(value).toLocaleString("en-AU", { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" }) + " UTC";
 }
 
 export function timeAgo(value: string) {

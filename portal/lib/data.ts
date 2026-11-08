@@ -155,7 +155,8 @@ export async function getRequest(context: Context, id: string) {
     const ready = [...events].reverse().find((event) => event.type === "triage.findings_ready");
     if (ready && Array.isArray(ready.payload.findings)) findings = ready.payload.findings as LogFinding[];
   }
-  const [{ data: verification }, { data: receipt }, { data: planApprovals }, { data: changeContext }, {data:executionChecks,error:checksError}, {data:nativeAssessments,error:nativeError}] = await Promise.all([
+  const [{data:monitor,error:monitorError}, { data: verification }, { data: receipt }, { data: planApprovals }, { data: changeContext }, {data:executionChecks,error:checksError}, {data:nativeAssessments,error:nativeError}] = await Promise.all([
+    context.supabase.from("assurance_monitors").select("enabled,interval_minutes,next_check_at").eq("action_request_id",id).maybeSingle(),
     context.supabase.from("change_verifications").select("state,details,checked_at").eq("action_request_id", id).maybeSingle(),
     context.supabase.from("proposal_receipts").select("artifact_path,artifact_sha256,policy_sha256,expires_at,created_at,manifest,manifest_sha256").eq("action_request_id", id).maybeSingle(),
     context.supabase.from("plan_approvals").select("plan_sha256,commit_sha,change_number,state,approver_email,expires_at,manifest_sha256s").contains("request_ids", [id]).order("created_at", { ascending: false }),
@@ -163,10 +164,10 @@ export async function getRequest(context: Context, id: string) {
     context.supabase.from("execution_check_events").select("*").eq("action_request_id",id).order("checked_at",{ascending:false}).limit(30),
     context.supabase.from("native_access_assessments").select("*").eq("action_request_id",id).order("checked_at",{ascending:false}).limit(5),
   ]);
-  if(checksError||nativeError) throw new Error("Assurance evidence could not be read.");
+  if(checksError||nativeError||monitorError) throw new Error("Assurance evidence could not be read.");
   if(executionChecks?.[0])request.execution={verdict:executionChecks[0].verdict,checkpoint:executionChecks[0].checkpoint,at:executionChecks[0].checked_at};
   if(planApprovals?.[0])request.executionApproval={state:planApprovals[0].state,changeNumber:planApprovals[0].change_number};
-  return { request, events, findings, verification, receipt, changeContext, planApprovals: planApprovals ?? [], executionChecks:executionChecks??[], nativeAssessments:nativeAssessments??[] };
+  return { monitor, request, events, findings, verification, receipt, changeContext, planApprovals: planApprovals ?? [], executionChecks:executionChecks??[], nativeAssessments:nativeAssessments??[] };
 }
 
 export type BucketCompliance = { bucket: string; location: string; labels: Record<string, string>; missing: string[] };
@@ -269,7 +270,7 @@ export async function sourceHealth(context: Context) {
   return data ?? [];
 }
 export async function operationalJobs(context: Context) {
-  const { data, error } = await context.supabase.from("workflow_jobs").select("id,job_type,status,attempts,max_attempts,last_error,updated_at,workflow_run_id").eq("tenant_id", context.tenantId).order("updated_at", { ascending: false }).limit(100);
+  const { data, error } = await context.supabase.from("workflow_jobs").select("id,job_type,status,attempts,max_attempts,last_error,updated_at,workflow_run_id,available_at,lease_until").eq("tenant_id", context.tenantId).order("updated_at", { ascending: false }).limit(100);
   if (error) throw new Error("Operational jobs are visible to platform administrators and auditors.");
   return data ?? [];
 }

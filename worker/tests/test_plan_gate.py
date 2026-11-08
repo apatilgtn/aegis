@@ -17,6 +17,7 @@ def gate():
     route = {'role_identifier':'roles/logging.viewer','scope_type':'project'}
     manifest = governance.approval_manifest(request, account, route, 'alice@example.com', 'alice@example.com')
     rows = {
+        'tenant_memberships': [{'status':'active'}],
         'action_requests': [request],
         'proposal_receipts': [{'project_id': 'project-a', 'artifact_sha256': 'a'*64, 'policy_sha256': governance.digest(policy), 'manifest':manifest, 'manifest_sha256':governance.digest(manifest), 'expires_at': FUTURE}],
         'workflow_runs': [{'external_references': {'servicenow': {'change_sys_id': 'original'}}}],
@@ -101,3 +102,14 @@ def test_missing_evidence_storage_blocks_authorization(gate):
     worker.insert=offline
     with pytest.raises(RuntimeError,match='Evidence storage'):
         plan_gate.authorize(payload,worker)
+
+
+def test_offboarded_identity_cannot_use_previously_approved_plan(gate):
+    worker,payload,rows,*_=gate
+    rows['tenant_memberships']=[]
+    recorded=[]
+    worker.insert=lambda table,row:recorded.append(row)
+    status,result=plan_gate.authorize(payload,worker)
+    assert status==403 and 'active workspace member' in result['error']
+    assert recorded[0]['verdict']=='denied'
+    assert recorded[0]['checks'][0]['key']=='active_membership'

@@ -94,6 +94,8 @@ def validate(connection):
                 cur.execute('select id from public.native_access_assessments where action_request_id=%s order by checked_at desc limit 1',(access[0],))
                 assessment=str(cur.fetchone()[0])
                 denied("update public.native_access_assessments set report='{}' where id=%s",(assessment,))
+        from scripts.validate_assurance_db import validate as validate_assurance
+        validate_assurance(cur,tenant,user)
         print('PASS: migrations, tenant isolation, admin controls, budget limits, service-only settlement, audit triggers, immutable receipts/checkpoints and read-only analysis enqueue')
 
 if __name__ == '__main__':

@@ -208,3 +208,10 @@ migration order, failure recovery, and the non-submitting assurance preview.
 Google historical Policy Simulator does not support the conditional bindings used
 by our temporary grants; this is displayed as unsupported. The native integration
 runs a project-scoped, read-only Policy Analyzer query and preserves unknowns.
+
+Reviewer roles now land at `/inbox`; `/overview` retains the activity view.
+Continuous read-back history is under `/assurance`, measured timing and effort
+under `/value`, and audited workspace suspension under `/people`. Secondary
+cloud/platform tools are collapsed in the sidebar. Dates display an explicit UTC
+zone. See [pilot acceptance](../docs/PRODUCTION_PILOT.md) and
+[enterprise readiness and restore drill](../docs/ENTERPRISE_READINESS.md).

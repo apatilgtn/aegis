@@ -570,3 +570,26 @@ export async function requestNativeAccessAnalysis(_previous: ActionState, form: 
  revalidatePath(`/requests/${id}`);
  return {ok:true,message:'Read-only GCP analysis queued. Its evidence will appear here when complete.'};
 }
+
+async function reviewOperation(rpc:string,args:Record<string,unknown>):Promise<ActionState> {
+ const context=await authenticatedContext();if('error' in context)return initialError(context.error??'Authentication required');
+ const {error}=await context.supabase.rpc(rpc,args);
+ if(error)return initialError(error.message);
+ revalidatePath('/inbox');revalidatePath('/assurance');revalidatePath('/value');revalidatePath('/people');revalidatePath('/requests','layout');
+ return {ok:true,message:'Recorded. Cloud approvals and permissions are unchanged.'};
+}
+export async function takeReviewOwnership(_:ActionState,form:FormData):Promise<ActionState>{
+ const due=new Date(Date.now()+Number(form.get('hours')??24)*3600000);
+ if(!Number.isFinite(due.getTime()))return initialError('Invalid deadline');
+ return reviewOperation('coordinate_request',{p_request:String(form.get('requestId')),p_due:due.toISOString()});
+}
+export async function configureAssurance(_:ActionState,form:FormData):Promise<ActionState>{
+ return reviewOperation('set_assurance_monitor',{p_request:String(form.get('requestId')),p_enabled:form.get('enabled')==='true',p_interval:Number(form.get('interval')??15)});
+}
+export async function recordEffort(_:ActionState,form:FormData):Promise<ActionState>{
+ return reviewOperation('record_operator_effort',{p_request:String(form.get('requestId')),p_minutes:Number(form.get('minutes')),p_note:String(form.get('note')??'')});
+}
+export async function suspendMember(_:ActionState,form:FormData):Promise<ActionState>{
+ const context=await authenticatedContext();if('error' in context)return initialError(context.error??'Authentication required');
+ return reviewOperation('suspend_workspace_member',{p_tenant:context.membership.tenant_id,p_user:String(form.get('userId'))});
+}
