@@ -13,6 +13,15 @@ Aegis membership. A coordinator is not an approver.
   reviewed bucket, one-hour maximum, production. Do not widen an existing route.
 - An administrator reviews capability availability and write controls. Enabling
   writes is a separate audited configuration action, not a side effect of setup.
+- Bucket-scoped grants require the pipeline to have
+  `storage.buckets.getIamPolicy` and `storage.buckets.setIamPolicy` on the dedicated
+  bucket. Project IAM-admin permission does not establish this. Do not grant the
+  operator service-account impersonation just to test pipeline configuration.
+  `python3 scripts/pilot_executor_plan.py --project YOUR_PROJECT_ID --project-number YOUR_PROJECT_NUMBER`
+  prints a read-only proposal with a maximum two-hour condition. Applying that IAM
+  change requires explicit operator approval. Use a condition file for the gcloud
+  binding and verify the expression in the bucket policy; remove the exact binding
+  after the pilot. The proposal tool never applies IAM or grants end-user access.
 - Independent ServiceNow approver and GitHub reviewer are available. Never approve
   for the beneficiary or reuse another person's session.
 - Record the request IDs, artifact/manifest/plan fingerprints, commit, approval
