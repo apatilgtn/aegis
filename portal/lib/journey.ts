@@ -8,7 +8,7 @@ export const STAGES = [
   { key: "approval", label: "Awaiting approval" },
   { key: "merge", label: "Awaiting merge" },
   { key: "working", label: "Aegis working" },
-  { key: "live", label: "Access live" },
+  { key: "live", label: "Verified grant window" },
 ] as const;
 
 export type StageKey = (typeof STAGES)[number]["key"];
@@ -66,12 +66,13 @@ export function segmentsOf(request: RequestView, events: EventView[], now = Date
   if (merged === null) return out;
 
   const applied = at(events, "delivery.completed", "delivery.failed");
-  push("working", merged, applied, "Pipeline applying in GCP");
+  push("working", merged, applied, "Protected pipeline and execution checkpoints");
   if (applied === null || at(events, "delivery.completed") === null) return out;
 
-  if (request.capability === "access_grant" && request.expiresAt) {
+  if (request.capability === "access_grant" && request.expiresAt && request.verification?.state === "verified") {
     const ends = new Date(request.expiresAt).getTime();
-    if (ends > applied) out.push({ stage: "live", start: applied, end: ends, detail: `GCP removes it at the end`, open: ends > now });
+    const verifiedAt = Math.max(applied, new Date(request.verification.checkedAt).getTime());
+    if (ends > verifiedAt) out.push({ stage: "live", start: verifiedAt, end: ends, detail: "Requested binding verified at the start; conditional grant window ends at the end", open: ends > now });
   }
   return out;
 }

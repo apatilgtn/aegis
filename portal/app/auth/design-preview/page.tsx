@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { AssuranceExample } from "@/components/assurance-example";
 import { notFound } from "next/navigation";
 import { WorkspaceFrame } from "@/components/workspace-frame";
 import { AccessForm } from "@/components/forms";
@@ -10,7 +11,7 @@ import type { EventView, RequestView } from "@/lib/view";
 // Static sample data only. This route is unavailable in production and never
 // reads workspace data or creates requests, tickets, approvals or cloud changes.
 export default async function DesignPreview({ searchParams }: {
-  searchParams: Promise<{ range?: string; type?: string; who?: string; empty?: string; mode?: string }>;
+  searchParams: Promise<{ range?: string; type?: string; who?: string; empty?: string; mode?: string; outcome?: string }>;
 }) {
   if (process.env.NODE_ENV !== "development") notFound();
   const params = await searchParams;
@@ -61,13 +62,14 @@ export default async function DesignPreview({ searchParams }: {
       delivery: { runUrl: null, reason: sample.status === "failed" ? "Sample pipeline failure" : null, mergedAt: null },
       triage: { summary: investigation ? "Three warning entries found." : null, findingCount: investigation ? 3 : null },
       lastError: null,
+      verification: sample.status === "completed" && sample.capability !== "incident_triage" ? {state:"verified",checkedAt:ago(sample.age - 3.6)} : undefined,
     });
     eventsByRequest.set(id, events);
   });
   return (
     <WorkspaceFrame tenantName="Aegis Cloud" openCount={5} overviewHref="/auth/design-preview" activeHref={params.mode === "review" ? "/review" : params.mode === "access" ? "/requests" : "/"} connection="sample" actions={<Link className="btn btn-primary btn-full" href="/new/access">+ New request</Link>} account={<div className="preview-account"><span className="avatar">AP</span><span><strong>Alex Parker</strong><small>Platform administrator</small></span></div>}>
-        <p className="preview-note">Design preview · sample requests only. <Link className="link" href="/auth/design-preview?empty=1">View empty state</Link> · <Link className="link" href="/auth/design-preview">Overview</Link> · <Link className="link" href="/auth/design-preview?mode=review">Change review</Link> · <Link className="link" href="/auth/design-preview?mode=access">Access wizard</Link></p>
-        {params.mode === "access" ? <><PageHead title="Request access" lede="A guided, scoped request with independent review. This is a non-submitting design preview."/><AccessForm preview identity="alex@example.com" prefill={{hours:1}} options={[{serviceId:"preview-service",serviceName:"Payments platform",cloud:"gcp",environment:"prod",tier:"tier1",role:"roles/logging.viewer",maxHours:4,target:"Production GCP project"},{serviceId:"preview-service",serviceName:"Payments platform",cloud:"gcp",environment:"prod",tier:"tier2",role:"roles/storage.objectUser",maxHours:1,target:"payments-exports bucket"}]}/></> : params.mode === "review" ? <ChangeReviewWorkspace defaultExample /> : <Overview requests={requests} eventsByRequest={eventsByRequest} labels={{ capturedAt: ago(0.25), projectId: "sample-project", required: ["owner", "cost-center", "environment"], buckets: [], compliant: 17, total: 20 }} userId="preview-user" params={{ range: "1d", ...params }} now={now} basePath="/auth/design-preview" />}
+        <p className="preview-note">Design preview · sample requests only. <Link className="link" href="/auth/design-preview?empty=1">View empty state</Link> · <Link className="link" href="/auth/design-preview">Overview</Link> · <Link className="link" href="/auth/design-preview?mode=review">Change review</Link> · <Link className="link" href="/auth/design-preview?mode=access">Access wizard</Link> · <Link className="link" href="/auth/design-preview?mode=assurance">Approval evidence</Link></p>
+        {params.mode === "assurance" ? <><PageHead title="Change assurance" lede="Reviewable approval facts, execution comparisons and observed outcomes."/><AssuranceExample blocked={params.outcome==="blocked"}/></> : params.mode === "access" ? <><PageHead title="Request access" lede="A guided, scoped request with independent review. This is a non-submitting design preview."/><AccessForm preview identity="alex@example.com" prefill={{hours:1}} options={[{serviceId:"preview-service",serviceName:"Payments platform",cloud:"gcp",environment:"prod",tier:"tier1",role:"roles/logging.viewer",maxHours:4,target:"Production GCP project"},{serviceId:"preview-service",serviceName:"Payments platform",cloud:"gcp",environment:"prod",tier:"tier2",role:"roles/storage.objectUser",maxHours:1,target:"payments-exports bucket"}]}/></> : params.mode === "review" ? <ChangeReviewWorkspace defaultExample /> : <Overview requests={requests} eventsByRequest={eventsByRequest} labels={{ capturedAt: ago(0.25), projectId: "sample-project", required: ["owner", "cost-center", "environment"], buckets: [], compliant: 17, total: 20 }} userId="preview-user" params={{ range: "1d", ...params }} now={now} basePath="/auth/design-preview" />}
     </WorkspaceFrame>
   );
 }

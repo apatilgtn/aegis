@@ -7,7 +7,7 @@ WORKDIR /app
 COPY --from=opa /opa /usr/local/bin/opa
 RUN pip install --no-cache-dir "PyJWT[crypto]==2.15.0" "google-auth==2.58.1" "requests==2.32.3"
 COPY policy /policies
-COPY worker/worker.py worker/gcp.py worker/servicenow.py worker/governance.py worker/plan_gate.py /app/
+COPY worker/worker.py worker/gcp.py worker/servicenow.py worker/governance.py worker/plan_gate.py worker/native_analysis.py /app/
 COPY worker/cloudrun-entrypoint.sh /usr/local/bin/aegis-entrypoint
 RUN rm -f /policies/*_test.rego \
     && chmod 0555 /usr/local/bin/aegis-entrypoint \

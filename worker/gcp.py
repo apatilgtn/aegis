@@ -254,3 +254,46 @@ def related_change_events(project_id: str, hint: str, hours: int) -> list[dict[s
     filter_ = f'logName={json.dumps("projects/" + project + "/logs/cloudaudit.googleapis.com%2Factivity")} AND timestamp>="{since}" AND (protoPayload.resourceName:{literal} OR resource.labels.service_name:{literal})'
     result = _call("POST", "https://logging.googleapis.com/v2/entries:list", {"resourceNames": ["projects/" + project], "filter": filter_, "orderBy": "timestamp desc", "pageSize": 20})
     return [{"timestamp": e.get("timestamp", ""), "method": str((e.get("protoPayload") or {}).get("methodName", ""))[:200], "resource": str((e.get("protoPayload") or {}).get("resourceName", ""))[:300], "service": str((e.get("protoPayload") or {}).get("serviceName", ""))[:100]} for e in result.get("entries", [])]
+
+
+def analyze_access(project_id: str, member: str, role: str, bucket: str | None = None) -> dict[str, Any]:
+    """Project-bounded native allow-policy evidence; never an authorization verdict."""
+    project_id = _require_project(project_id)
+    if not re.fullmatch(r'user:[^\s@]+@[^\s@]+', member) or not re.fullmatch(r'roles/[A-Za-z0-9_.]+', role):
+        raise GcpError('Invalid reviewed identity or role', retryable=False)
+    if bucket and not _BUCKET.fullmatch(bucket):
+        raise GcpError('Invalid reviewed bucket', retryable=False)
+    if bucket:
+        resource = '//storage.googleapis.com/buckets/' + bucket
+    else:
+        resource = '//cloudresourcemanager.googleapis.com/projects/' + project_id
+    query = {'analysisQuery.identitySelector.identity': member,
+             'analysisQuery.resourceSelector.fullResourceName': resource,
+             'analysisQuery.accessSelector.roles': role,
+             'analysisQuery.options.expandGroups': 'false',
+             'analysisQuery.options.expandRoles': 'true', 'executionTimeout': '10s'}
+    result = _call('GET', f'https://cloudasset.googleapis.com/v1/projects/{project_id}:analyzeIamPolicy?' + urllib.parse.urlencode(query))
+    analysis = result.get('mainAnalysis') or {}
+    if not isinstance(result.get('mainAnalysis'), dict) or not isinstance(analysis.get('analysisResults', []), list):
+        raise GcpError('Native analysis response was incomplete', retryable=False)
+    rows = analysis.get('analysisResults') or []
+    bindings = []
+    conditions = set()
+    for row in rows[:50]:
+        binding = row.get('iamBinding') or {}
+        for acl in row.get('accessControlLists') or []:
+            if binding.get('condition'):
+                conditions.add((acl.get('conditionEvaluation') or {}).get('evaluationValue', 'UNKNOWN'))
+        bindings.append({'attached_to': row.get('attachedResourceFullName'), 'role': binding.get('role'),
+                         'conditional': bool(binding.get('condition')), 'fully_explored': row.get('fullyExplored') is True})
+    errors = [str(e.get('code', 'UNKNOWN')) for e in analysis.get('nonCriticalErrors') or []]
+    complete = result.get('fullyExplored') is True and analysis.get('fullyExplored') is True
+    partial = not complete or bool(errors) or bool(conditions - {'TRUE', 'FALSE'}) or len(rows) > 50
+    return {'state': 'partial' if partial else 'available', 'fully_explored': complete, 'identity': member,
+            'role': role, 'resource': resource, 'binding_count': len(rows), 'bindings': bindings,
+            'condition_evaluations': sorted(conditions), 'error_codes': errors, 'truncated': len(rows) > 50,
+            'summary': f'Google returned {len(rows)} matching or potentially matching allow-policy bindings.',
+            'limitations': ['Current-state allow-policy query, not a simulation of the proposed grant.',
+                            'Query scope is this project; ancestor policies outside it are not analyzed.',
+                            'Group expansion, deny policies and principal access boundaries are not assessed.',
+                            'No matching result does not prove that the identity has no other access.']}

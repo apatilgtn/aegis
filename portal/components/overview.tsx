@@ -67,7 +67,7 @@ export function Overview({ requests, eventsByRequest, labels, userId, params, no
   const medianNow = median(approvalTimes(thisPeriod));
   const medianBefore = median(approvalTimes(lastPeriod));
   const waiting = scoped.filter((r) => r.status === "awaiting_approval" && r.capability !== "incident_triage").length;
-  const active = scoped.filter((r) => r.capability === "access_grant" && r.status === "completed" && r.expiresAt && new Date(r.expiresAt).getTime() > now)
+  const active = scoped.filter((r) => r.capability === "access_grant" && r.status === "completed" && r.verification?.state === "verified" && r.expiresAt && new Date(r.expiresAt).getTime() > now)
     .sort((a, b) => new Date(a.expiresAt!).getTime() - new Date(b.expiresAt!).getTime());
   const forMe = requests.filter((r) => needsMe(r, userId));
   const coverage = labels && labels.total ? Math.round((labels.compliant / labels.total) * 100) : null;

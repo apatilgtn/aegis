@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -45,7 +46,7 @@ class NoopHeartbeat:
 
 def test_policy_handler_is_registered():
     assert worker.registered_job_types() == [
-        "create_github_proposal", "create_servicenow_incident", "evaluate_policy",
+        "analyze_access", "create_github_proposal", "create_servicenow_incident", "evaluate_policy",
         "search_logs", "servicenow_approval", "track_github_delivery", "verify_change",
     ]
 
@@ -401,7 +402,7 @@ def test_proposal_requires_approval_first():
 
 
 def test_servicenow_approval_handler_reports_decision(monkeypatch):
-    request = proposal_request(status="awaiting_approval", policy_decision={"policy_ids": ["AEGIS-ACCESS-001"], "risk_level": "low"})
+    request = proposal_request(status="awaiting_approval", policy_decision={"policy_ids": ["AEGIS-ACCESS-001"], "risk_level": "low", "proposed_expires_at": (datetime.now(timezone.utc)+timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")})
     common(monkeypatch, request)
     calls = capture_rpc(monkeypatch)
     opened = {}

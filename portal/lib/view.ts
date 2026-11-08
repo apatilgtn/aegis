@@ -25,6 +25,9 @@ export type RequestView = {
   delivery: { runUrl: string | null; reason: string | null; mergedAt: string | null };
   triage: { summary: string | null; findingCount: number | null };
   lastError: string | null;
+  verification?: {state:string;checkedAt:string};
+  execution?: {verdict:string;checkpoint:string;at:string};
+  executionApproval?: {state:string;changeNumber:string|null};
 };
 
 export type EventView = { id: number; type: string; at: string; payload: Record<string, unknown> };
@@ -78,7 +81,11 @@ export function statusOf(request: RequestView): { label: string; tone: Tone } {
     )[s] ?? { label: s, tone: "neutral" };
   }
   if (s === "completed" && request.capability === "access_grant" && request.expiresAt && new Date(request.expiresAt) <= new Date()) {
-    return { label: "Expired", tone: "neutral" };
+    return { label: "Grant window ended", tone: "neutral" };
+  }
+  if(s === "completed") {
+    const state=request.verification?.state;
+    return state==="verified" ? {label:request.capability==="label_fix"?"Labels verified":"Access verified",tone:"good"} : state==="failed" ? {label:"Verification mismatch",tone:"bad"} : {label:state==="unavailable"?"Read-back unavailable":"Pipeline finished · unverified",tone:"warn"};
   }
   return (
     {
@@ -160,16 +167,22 @@ export function stepsOf(request: RequestView): Step[] {
       href: request.github.prUrl,
     },
     {
-      key: "apply", label: request.capability === "label_fix" ? "Labels applied in GCP" : "Access granted in GCP",
+      key: "apply", label: "Protected pipeline",
       state: policyDenied || rejectedInSnow || prClosed ? "skipped" : s === "completed" ? "done" : s === "failed" && request.github.prNumber ? "failed" : reached("merged") ? "current" : "todo",
       detail: s === "failed" ? request.delivery.reason ?? request.lastError ?? undefined : request.delivery.runUrl ? "Pipeline run" : undefined,
       href: request.delivery.runUrl,
     },
   ];
+  steps.splice(4,0,{
+    key:"exact_plan",label:"Exact-plan approval",state:request.executionApproval?.state==="approved"?"done":request.executionApproval?.state==="rejected"?"failed":reached("merged")?"current":"todo",detail:request.executionApproval?.changeNumber??"Separate approval of the saved execution plan",
+  },{
+    key:"execution_gate",label:"Execution checkpoint",state:request.execution?.verdict==="denied"?"failed":request.execution?.verdict==="authorized"&&request.execution.checkpoint==="pre_apply"?"done":reached("merged")?"current":"todo",detail:request.execution?`${request.execution.checkpoint.replaceAll("_"," ")} · ${request.execution.verdict} · ${formatDate(request.execution.at)}`:"Identity, scope, policy and expiry must still match",
+  });
+  steps.push({key:"verification",label:"GCP read-back",state:request.verification?.state==="verified"?"done":request.verification?.state==="failed"?"failed":s==="completed"?"current":"todo",detail:request.verification?`${request.verification.state} · ${formatDate(request.verification.checkedAt)}`:"Cloud verification is separate from pipeline success"});
   if (request.capability === "access_grant") {
     const expired = request.expiresAt ? new Date(request.expiresAt) <= new Date() : false;
     steps.push({
-      key: "expiry", label: "Removed automatically",
+      key: "expiry", label: "Conditional grant window",
       state: terminalBad || policyDenied ? "skipped" : expired ? "done" : s === "completed" ? "current" : "todo",
       detail: request.expiresAt ? `${expired ? "Ended" : "Ends"} ${formatDate(request.expiresAt)}` : undefined,
     });

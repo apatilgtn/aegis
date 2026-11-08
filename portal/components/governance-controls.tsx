@@ -1,7 +1,7 @@
 "use client";
 import { useActionState } from "react";
 import { LoaderCircle, Pause, Play, Save, ShieldCheck } from "lucide-react";
-import { requestVerification, changeServiceOwnership, changeAiRouting, changeCapabilityPolicy, changeEntitlementScope, changeGovernanceControl, changeGovernanceLimit, retryReadStep, type ActionState } from "@/app/actions";
+import { requestNativeAccessAnalysis, requestVerification, changeServiceOwnership, changeAiRouting, changeCapabilityPolicy, changeEntitlementScope, changeGovernanceControl, changeGovernanceLimit, retryReadStep, type ActionState } from "@/app/actions";
 import type { CapabilityPolicy, GovernanceSettings } from "@/lib/data";
 const initial: ActionState = { ok: false, message: "" };
 function Message({ state }: { state: ActionState }) { return state.message ? <p className={`control-feedback ${state.ok ? "good" : "bad"}`} role="status">{state.message}</p> : null; }
@@ -38,4 +38,9 @@ export function OwnershipEditor({service,owner,runbook}:{service:string;owner:st
 export function VerifyChangeButton({requestId}:{requestId:string}) {
  const [state,action,pending]=useActionState(requestVerification,initial);
  return <form action={action}><input type="hidden" name="requestId" value={requestId}/><button className="btn" disabled={pending}>{pending ? <LoaderCircle className="spin" size={13}/> : <ShieldCheck size={13}/>}Recheck cloud state</button><Message state={state}/></form>;
+}
+
+export function NativeAnalysisButton({requestId}:{requestId:string}) {
+ const [state,action,pending]=useActionState(requestNativeAccessAnalysis,initial);
+ return <form action={action}><input type="hidden" name="requestId" value={requestId}/><button className="btn" disabled={pending}>{pending?<LoaderCircle className="spin" size={13}/>:<ShieldCheck size={13}/>}Analyze current GCP access</button><Message state={state}/></form>;
 }

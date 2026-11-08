@@ -44,7 +44,7 @@ def control_denials(request: dict, account: dict, settings: dict, policy: dict, 
 
 def verify_labels(expected: dict[str, str], observed: dict[str, str]) -> dict:
     missing = [key for key, value in expected.items() if observed.get(key) != value]
-    return {"state": "failed" if missing else "verified", "details": {"checked_keys": sorted(expected), "mismatched_keys": missing, "scope": "Requested label values only"}}
+    return {"state": "failed" if missing else "verified", "details": {"checked_keys": sorted(expected), "mismatched_keys": missing, "scope": "Requested label values only", "comparison": [{"key": key, "expected": value, "observed": observed.get(key), "present": key in observed, "matched": observed.get(key) == value} for key, value in sorted(expected.items())]}}
 
 
 def verify_iam(policy: dict, role: str, member: str, expiry: str, now: datetime | None = None) -> dict:
@@ -52,5 +52,30 @@ def verify_iam(policy: dict, role: str, member: str, expiry: str, now: datetime 
     if datetime.fromisoformat(expiry.replace("Z", "+00:00")) <= now:
         return {"state": "expired", "details": {"expires_at": expiry, "scope": "Grant window has ended"}}
     expression = f'request.time < timestamp("{expiry}")'
-    found = any(b.get("role") == role and member in b.get("members", []) and (b.get("condition") or {}).get("expression") == expression for b in policy.get("bindings", []))
-    return {"state": "verified" if found else "failed", "details": {"role": role, "member": member, "expires_at": expiry, "scope": "Requested conditional binding only; inherited and other grants are not assessed"}}
+    candidates = [b for b in policy.get("bindings", []) if b.get("role") == role and member in b.get("members", [])]
+    found = any((b.get("condition") or {}).get("expression") == expression for b in candidates)
+    return {"state": "verified" if found else "failed", "details": {"role": role, "member": member, "expires_at": expiry, "scope": "Requested conditional binding only; inherited and other grants are not assessed", "expected_condition": expression, "observed_conditions": [(b.get("condition") or {}).get("expression") for b in candidates[:10]], "matching_role_member_bindings": len(candidates), "observations_truncated": len(candidates) > 10}}
+
+
+def approval_manifest(request: dict, account: dict, route: dict | None, requester: str, beneficiary: str) -> dict:
+    """Stable authorization facts; no model-generated interpretation or wall clock."""
+    decision = request.get('policy_decision') or {}
+    resource = request.get('resource') or {}
+    scope = {'project': account['project_id'], 'environment': account.get('environment'),
+             'type': route.get('scope_type', 'project') if route else 'bucket',
+             'resource': (route.get('scope_identifier') or account['project_id']) if route else resource.get('bucket'),
+             'role': route.get('role_identifier') if route else None}
+    return {'version': 1, 'requester_id': request['requester_id'], 'requester': requester.lower(),
+            'beneficiary_id': request.get('beneficiary_id') or request['requester_id'], 'beneficiary': beneficiary.lower(),
+            'capability': request['capability'], 'scope': scope,
+            'grant_expires_at': decision.get('proposed_expires_at'),
+            'policy_bundle_sha256': decision.get('policy_bundle_sha256'),
+            'governance_revision': decision.get('governance_revision')}
+
+
+def compare_manifest(approved: dict, current: dict) -> list[dict]:
+    labels = {'requester_id': 'Requester identity', 'requester': 'Requester email', 'beneficiary_id': 'Beneficiary identity',
+              'beneficiary': 'Beneficiary email', 'capability': 'Capability', 'scope': 'Cloud scope and role',
+              'grant_expires_at': 'Grant expiry', 'policy_bundle_sha256': 'Policy bundle', 'governance_revision': 'Policy revision'}
+    return [{'key': key, 'label': label, 'state': 'matched' if approved.get(key) == current.get(key) else 'changed',
+             'approved': approved.get(key), 'current': current.get(key)} for key, label in labels.items()]

@@ -28,12 +28,13 @@ from typing import Any
 import jwt
 
 try:  # imported as a package (tests)
-    from . import gcp, servicenow, governance, plan_gate
+    from . import gcp, servicenow, governance, plan_gate, native_analysis
 except ImportError:  # run as /app/worker.py
     import gcp  # type: ignore[no-redef]
     import servicenow  # type: ignore[no-redef]
     import governance  # type: ignore[no-redef]
     import plan_gate  # type: ignore[no-redef]
+    import native_analysis  # type: ignore[no-redef]
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -619,7 +620,9 @@ def handle_delivery_tracking(job: dict[str, Any]) -> None:
     if state == "completed" and action_request.get("capability") == "access_grant":
         details["expires_at"] = access_expires_at(action_request)
     if state == "completed":
-        verify_delivered_change(action_request)
+        verification = verify_delivered_change(action_request)
+        if verification:
+            details["verification_state"] = verification["state"]
     if state in ("completed", "failed", "cancelled"):
         note_servicenow_outcome(job, state, details)
     rpc("record_github_delivery", {
@@ -633,14 +636,19 @@ def upsert(table: str, row: dict[str, Any], conflict: str) -> None:
     request_json(f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={urllib.parse.quote(conflict, safe=',')}", method="POST", body=row, supabase=True, extra_headers={"Prefer": "resolution=merge-duplicates"})
 
 
-def verify_delivered_change(action_request: dict[str, Any]) -> None:
+def verify_delivered_change(action_request: dict[str, Any]) -> dict:
     try:
         account = cloud_account(str(action_request["tenant_id"]))
+        receipts = select("proposal_receipts", f"action_request_id=eq.{action_request['id']}&limit=1")
+        manifest = receipts[0].get("manifest") if receipts else None
+        if manifest is not None and (not isinstance(manifest, dict) or receipts[0].get("manifest_sha256") != governance.digest(manifest)):
+            raise NonRetryableJobError("Approved verification manifest is invalid")
         if action_request["capability"] == "label_fix":
-            expected = json.loads(render_label_fix(action_request, account["project_id"], user_email(action_request["requester_id"])))
+            requester = manifest["requester"] if manifest else user_email(action_request["requester_id"])
+            expected = json.loads(render_label_fix(action_request, account["project_id"], requester))
             result = governance.verify_labels(expected["add_labels"], gcp.bucket_labels(expected["bucket"]))
         else:
-            scope = (action_request.get("policy_decision") or {}).get("reviewed_scope")
+            scope = manifest["scope"] if manifest else (action_request.get("policy_decision") or {}).get("reviewed_scope")
             if scope:
                 project, role = scope["project"], scope["role"]
                 bucket = scope["resource"] if scope["type"] == "bucket" else None
@@ -651,10 +659,13 @@ def verify_delivered_change(action_request: dict[str, Any]) -> None:
                 project, role = account["project_id"], route["role_identifier"]
                 bucket = route.get("scope_identifier") if route.get("scope_type") == "bucket" else None
             observed = gcp.iam_policy(project, bucket)
-            result = governance.verify_iam(observed, role, "user:" + user_email(action_request.get("beneficiary_id") or action_request["requester_id"]), access_expires_at(action_request))
+            beneficiary = manifest["beneficiary"] if manifest else user_email(action_request.get("beneficiary_id") or action_request["requester_id"])
+            expiry = manifest["grant_expires_at"] if manifest else access_expires_at(action_request)
+            result = governance.verify_iam(observed, role, "user:" + beneficiary, expiry)
     except Exception as exc:
         result = {"state": "unavailable", "details": {"reason": type(exc).__name__, "scope": "Cloud read-back could not finish; CI success is not treated as verification"}}
     upsert("change_verifications", {"action_request_id": action_request["id"], "tenant_id": action_request["tenant_id"], **result, "checked_at": datetime.now(timezone.utc).isoformat()}, "action_request_id")
+    return result
 
 
 @register_handler("verify_change")
@@ -666,13 +677,39 @@ def handle_change_verification(job: dict[str, Any]) -> None:
     rpc("complete_change_verification", {"p_job": job["id"], "p_worker": WORKER_ID})
 
 
+@register_handler("analyze_access")
+def handle_native_access_analysis(job: dict[str, Any]) -> None:
+    request = load_request(job)
+    if request["capability"] != "access_grant":
+        raise NonRetryableJobError("Native access analysis requires an access request")
+    account = None
+    try:
+        account, _, _, route = governance_context(request)
+        approved_scope = (request.get("policy_decision") or {}).get("reviewed_scope")
+        if approved_scope:
+            if approved_scope.get("project") != account["project_id"]:
+                route = None
+            else:
+                route = {"role_identifier": approved_scope["role"], "scope_type": approved_scope["type"], "scope_identifier": approved_scope["resource"]}
+                if route["scope_type"] == "bucket" and not any(b["name"] == route["scope_identifier"] for b in gcp.list_buckets(account["project_id"])):
+                    route = None
+        report = native_analysis.assess(gcp, account, route, user_email(request.get("beneficiary_id") or request["requester_id"]))
+    except Exception as exc:
+        report = native_analysis.assess(gcp, {}, None, "")
+        report["analyzer"].update(summary="Reviewed context or identity could not be read. No access conclusion was made.", error_type=type(exc).__name__)
+    rpc("complete_native_access_analysis", {"p_job": job["id"], "p_worker": WORKER_ID, "p_report": report})
+    state = report["analyzer"]["state"]
+    if account:
+        source_health(request["tenant_id"], account["project_id"], "native_iam", "healthy" if state in ("available", "partial") else "unavailable", report["analyzer"]["summary"])
+
+
 def note_servicenow_outcome(job: dict[str, Any], state: str, details: dict[str, Any]) -> None:
     """Best effort: the change record shows how delivery ended. Never blocks delivery."""
     change = servicenow_reference(job)
     if not change.get("change_sys_id"):
         return
     lines = {
-        "completed": "Applied by the Aegis pipeline.",
+        "completed": f"The apply pipeline finished successfully. Separate cloud read-back: {details.get('verification_state', 'not recorded')}. This is not an assessment of inherited or other access grants.",
         "failed": f"Delivery failed: {details.get('reason', 'unknown reason')}.",
         "cancelled": "The pull request was closed without merging; nothing was changed.",
     }[state]
@@ -733,11 +770,13 @@ def handle_servicenow_approval(job: dict[str, Any]) -> None:
         if action_request["capability"] == "access_grant":
             expiry = min(expiry, datetime.fromisoformat(access_expires_at(action_request).replace("Z", "+00:00")))
         receipt = {"action_request_id": action_request["id"], "tenant_id": action_request["tenant_id"], "project_id": project, "artifact_path": file_path, "artifact_sha256": governance.digest(content), "policy_sha256": governance.digest(action_request.get("policy_decision") or {}), "expires_at": expiry.isoformat()}
+        manifest = governance.approval_manifest(action_request, account, route, requester, user_email(action_request.get("beneficiary_id") or action_request["requester_id"]))
+        receipt.update({"manifest": manifest, "manifest_sha256": governance.digest(manifest)})
         insert("proposal_receipts", receipt)
     if datetime.fromisoformat(receipt["expires_at"].replace("Z", "+00:00")) <= datetime.now(timezone.utc):
         raise NonRetryableJobError("The approval window expired; submit a fresh request")
     title, body = describe_request(action_request, requester, project)
-    body += f"\n\nArtifact: {file_path}\nSHA-256: {receipt['artifact_sha256']}\nPolicy SHA-256: {receipt['policy_sha256']}\nApproval expires: {receipt['expires_at']}"
+    body += f"\n\nApproval manifest SHA-256: {receipt.get('manifest_sha256', 'Legacy receipt')}\nArtifact: {file_path}\nSHA-256: {receipt['artifact_sha256']}\nPolicy SHA-256: {receipt['policy_sha256']}\nApproval expires: {receipt['expires_at']}"
     change = servicenow.open_change_for_approval(config, request_id=str(action_request["id"]), requester_email=requester,
                                                  short_description=title, description=body)
     decision = servicenow.approval_decision(config, change["change_sys_id"], requester)

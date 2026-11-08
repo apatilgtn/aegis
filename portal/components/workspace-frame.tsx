@@ -18,6 +18,7 @@ const NAV = [
   { href: "/services", label: "Service catalog", icon: Blocks, group: "Platform" },
   { href: "/operations", label: "Operations", icon: Activity, group: "Platform" },
   { href: "/integrations", label: "Integrations", icon: Plug, group: "Platform" },
+  { href: "/setup", label: "Readiness & recovery", icon: ShieldCheck, group: "Platform" },
   { href: "/administration", label: "Governance controls", icon: SlidersHorizontal, group: "Platform" },
 ];
 

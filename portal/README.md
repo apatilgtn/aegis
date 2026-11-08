@@ -195,3 +195,16 @@ Every apply job first runs `scripts/pipeline_plan_gate.py --smoke` with its
 federated pipeline identity. This submits an empty, invalid plan and requires
 the authenticated governance validation response, proving connectivity without
 creating a ServiceNow change or authorizing any mutation.
+
+### Approval evidence and native GCP context
+
+Request detail now separates immutable approved facts, execution comparisons,
+native access context and actual GCP read-back. Pipeline completion cannot mark
+access live or draw a verified grant window without cloud verification.
+`/setup` provides deployment readiness and recovery guidance.
+
+See [GCP change assurance](../docs/GCP_ASSURANCE.md) for coverage, permissions,
+migration order, failure recovery, and the non-submitting assurance preview.
+Google historical Policy Simulator does not support the conditional bindings used
+by our temporary grants; this is displayed as unsupported. The native integration
+runs a project-scoped, read-only Policy Analyzer query and preserves unknowns.

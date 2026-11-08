@@ -48,14 +48,14 @@ def call_gate(payload: dict, url: str, token: str) -> tuple[int, dict]:
         raise RuntimeError(f"Execution authorization denied (HTTP {exc.code})") from exc
 
 
-def smoke_gate(url: str, token: str) -> None:
+def smoke_gate(url: str, token: str, project: str = "") -> None:
     """Verify IAM/audience/caller checks with a deliberately invalid empty plan.
 
     This fails before any approval record or ServiceNow change can be created.
     """
     if not url.startswith("https://"):
         raise ValueError("The gate must use HTTPS")
-    request = urllib.request.Request(url.rstrip("/") + "/governance/plan", data=b'{"request_ids":[]}', headers={"Authorization": "Bearer " + token, "X-Aegis-Token": token, "Content-Type": "application/json"}, method="POST")
+    request = urllib.request.Request(url.rstrip("/") + "/governance/plan", data=json.dumps({"request_ids": [], "smoke": True, "project_id": project}).encode(), headers={"Authorization": "Bearer " + token, "X-Aegis-Token": token, "Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30):
             raise RuntimeError("The gate accepted an invalid smoke-test plan")
@@ -95,7 +95,7 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true")
     args = parser.parse_args()
     if args.smoke:
-        smoke_gate(os.environ["AEGIS_GATE_URL"], os.environ["AEGIS_GATE_TOKEN"])
+        smoke_gate(os.environ["AEGIS_GATE_URL"], os.environ["AEGIS_GATE_TOKEN"], os.environ["GCP_PROJECT_ID"])
         return
     project, commit = os.environ["GCP_PROJECT_ID"], os.environ["GITHUB_SHA"]
     if args.label_plan:
@@ -105,6 +105,7 @@ def main() -> None:
         if not args.terraform_plan or not args.terraform_json:
             raise ValueError("Provide a saved Terraform plan and its JSON representation")
         payload = terraform_payload(args.terraform_plan, json.loads(args.terraform_json.read_text()), project, commit)
+    payload["checkpoint"] = "approval" if args.wait else "pre_apply"
     changed = await_approval(payload, args.wait)
     if os.getenv("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:

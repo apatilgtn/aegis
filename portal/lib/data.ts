@@ -68,7 +68,7 @@ type RequestRow = {
 
 type RunRow = { action_request_id: string; external_references: Record<string, Record<string, unknown>> | null; last_error_summary: string | null };
 
-function toView(row: RequestRow, run: RunRow | undefined): RequestView {
+function toView(row: RequestRow, run: RunRow | undefined, verification?: {state:string;checked_at:string}): RequestView {
   const refs = run?.external_references ?? {};
   const sn = refs.servicenow ?? {};
   const gh = refs.github ?? {};
@@ -106,6 +106,7 @@ function toView(row: RequestRow, run: RunRow | undefined): RequestView {
     delivery: { runUrl: text(delivery.workflow_run_url), reason: text(delivery.reason), mergedAt: text(delivery.merged_at) },
     triage: { summary: text(triage.summary), findingCount: number(triage.finding_count) },
     lastError: run?.last_error_summary ?? null,
+    verification: verification ? {state:verification.state,checkedAt:verification.checked_at} : undefined,
   };
 }
 
@@ -114,13 +115,14 @@ const REQUEST_COLUMNS =
 
 async function withRuns(context: Context, rows: RequestRow[]) {
   if (!rows.length) return [];
-  const { data: runs, error: runsError } = await context.supabase
-    .from("workflow_runs")
-    .select("action_request_id,external_references,last_error_summary")
-    .in("action_request_id", rows.map((row) => row.id));
-  if (runsError) throw new Error("Workflow status could not be read. Please retry.");
-  const byRequest = new Map((runs as RunRow[] | null ?? []).map((run) => [run.action_request_id, run]));
-  return rows.map((row) => toView(row, byRequest.get(row.id)));
+  const [{data:runs,error:runsError},{data:verified,error:verificationError}] = await Promise.all([
+    context.supabase.from("workflow_runs").select("action_request_id,external_references,last_error_summary").in("action_request_id", rows.map(r=>r.id)),
+    context.supabase.from("change_verifications").select("action_request_id,state,checked_at").in("action_request_id",rows.map(r=>r.id)),
+  ]);
+  if(runsError||verificationError) throw new Error("Workflow or verification evidence could not be read.");
+  const byRequest=new Map((runs as RunRow[]|null??[]).map(run=>[run.action_request_id,run]));
+  const byVerification=new Map((verified??[]).map(v=>[v.action_request_id,v]));
+  return rows.map(row=>toView(row,byRequest.get(row.id),byVerification.get(row.id)));
 }
 
 export const listRequests = cache(async (context: Context, limit = 100): Promise<RequestView[]> => {
@@ -153,13 +155,18 @@ export async function getRequest(context: Context, id: string) {
     const ready = [...events].reverse().find((event) => event.type === "triage.findings_ready");
     if (ready && Array.isArray(ready.payload.findings)) findings = ready.payload.findings as LogFinding[];
   }
-  const [{ data: verification }, { data: receipt }, { data: planApprovals }, { data: changeContext }] = await Promise.all([
+  const [{ data: verification }, { data: receipt }, { data: planApprovals }, { data: changeContext }, {data:executionChecks,error:checksError}, {data:nativeAssessments,error:nativeError}] = await Promise.all([
     context.supabase.from("change_verifications").select("state,details,checked_at").eq("action_request_id", id).maybeSingle(),
-    context.supabase.from("proposal_receipts").select("artifact_path,artifact_sha256,policy_sha256,expires_at,created_at").eq("action_request_id", id).maybeSingle(),
-    context.supabase.from("plan_approvals").select("plan_sha256,commit_sha,change_number,state,approver_email,expires_at").contains("request_ids", [id]).order("created_at", { ascending: false }),
+    context.supabase.from("proposal_receipts").select("artifact_path,artifact_sha256,policy_sha256,expires_at,created_at,manifest,manifest_sha256").eq("action_request_id", id).maybeSingle(),
+    context.supabase.from("plan_approvals").select("plan_sha256,commit_sha,change_number,state,approver_email,expires_at,manifest_sha256s").contains("request_ids", [id]).order("created_at", { ascending: false }),
     context.supabase.from("triage_change_context").select("changes,state,coverage,captured_at").eq("action_request_id",id).maybeSingle(),
+    context.supabase.from("execution_check_events").select("*").eq("action_request_id",id).order("checked_at",{ascending:false}).limit(30),
+    context.supabase.from("native_access_assessments").select("*").eq("action_request_id",id).order("checked_at",{ascending:false}).limit(5),
   ]);
-  return { request, events, findings, verification, receipt, changeContext, planApprovals: planApprovals ?? [] };
+  if(checksError||nativeError) throw new Error("Assurance evidence could not be read.");
+  if(executionChecks?.[0])request.execution={verdict:executionChecks[0].verdict,checkpoint:executionChecks[0].checkpoint,at:executionChecks[0].checked_at};
+  if(planApprovals?.[0])request.executionApproval={state:planApprovals[0].state,changeNumber:planApprovals[0].change_number};
+  return { request, events, findings, verification, receipt, changeContext, planApprovals: planApprovals ?? [], executionChecks:executionChecks??[], nativeAssessments:nativeAssessments??[] };
 }
 
 export type BucketCompliance = { bucket: string; location: string; labels: Record<string, string>; missing: string[] };
@@ -296,5 +303,6 @@ export async function personalAccess(context:Context){
  ]);
  if(activeError||pendingError||historyError)throw new Error("Personal access could not be loaded.");
  const a=await withRuns(context,(active as RequestRow[]|null)??[]),p=await withRuns(context,(pending as RequestRow[]|null)??[]),h=await withRuns(context,(history as RequestRow[]|null)??[]);
- return{active:a,pending:p,history:h.filter(r=>!a.some(v=>v.id===r.id))};
+ const verified=a.filter(r=>r.verification?.state==="verified"),unverified=a.filter(r=>r.verification?.state!=="verified");
+ return{active:verified,pending:[...unverified,...p],history:h.filter(r=>!a.some(v=>v.id===r.id))};
 }

@@ -1,4 +1,4 @@
-import { VerifyChangeButton } from "@/components/governance-controls";
+import { RequestAssurance } from "@/components/request-assurance";
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { ExternalLink, Info } from "lucide-react";
@@ -26,8 +26,9 @@ function whatNow(request: RequestView, mine: boolean): string {
     : "Opening a change in ServiceNow for approval.";
   if (s === "proposal_pending") return "Approved in ServiceNow. Aegis is opening the pull request.";
   if (s === "pr_open") return "The pull request is open. A person must review and merge it on GitHub before anything changes.";
-  if (s === "merged" || s === "applying") return "Merged. The protected pipeline is applying the change in GCP.";
+  if (s === "merged" || s === "applying") return "The pipeline has started. Exact-plan approval and execution checks must pass before any cloud change.";
   if (s === "completed") {
+    if(request.verification?.state!=="verified")return request.verification?.state==="failed"?"The pipeline finished, but cloud read-back did not match the requested outcome. Review the comparison before relying on this change.":"The pipeline finished. The requested cloud outcome has not been independently verified; review the read-back evidence below.";
     if (request.capability === "label_fix") return "The missing labels were added to the bucket. Existing labels were not changed.";
     return request.expiresAt && new Date(request.expiresAt) > new Date()
       ? `Access is live. GCP removes it automatically on ${formatDate(request.expiresAt)}.`
@@ -43,7 +44,7 @@ export default async function RequestPage({ params }: { params: Promise<{ id: st
   const { id } = await params;
   const found = await getRequest(context, id);
   if (!found) notFound();
-  const { request, events, findings, verification, receipt, planApprovals, changeContext } = found;
+  const { request, events, findings, verification, receipt, planApprovals, changeContext, executionChecks, nativeAssessments } = found;
   const mine = request.requesterId === context.userId;
 
   return (
@@ -127,7 +128,7 @@ export default async function RequestPage({ params }: { params: Promise<{ id: st
             <Timeline steps={stepsOf(request)} />
           </div>
 
-          <section className="workflow-panel request-evidence"><div className="section-head"><h2>Execution evidence</h2>{context.role === "platform_admin" && request.status === "completed" && request.capability !== "incident_triage" && <VerifyChangeButton requestId={request.id}/>}{["platform_admin","auditor"].includes(context.role) && <a className="btn" href={`/api/evidence?requestId=${request.id}`}>Export request evidence</a>}</div><div className="verification-state"><span className={`badge ${verification?.state === "verified" ? "good" : verification?.state === "failed" ? "bad" : "warn"}`}>{verification?.state ?? (request.status === "completed" ? "Not independently verified" : "Awaiting delivery")}</span><span className="muted">Pipeline success and cloud verification are separate states.</span></div>{verification && <><p className="muted">Checked {formatDate(verification.checked_at)}</p><pre className="event-json">{JSON.stringify(verification.details,null,2)}</pre></>}{receipt ? <dl className="kv"><dt>Approved source</dt><dd className="mono">{receipt.artifact_path}</dd><dt>Artifact SHA-256</dt><dd className="mono">{receipt.artifact_sha256}</dd><dt>Policy SHA-256</dt><dd className="mono">{receipt.policy_sha256}</dd><dt>Approval deadline</dt><dd>{formatDate(receipt.expires_at)}</dd></dl> : <p className="muted">No immutable proposal receipt is available. Older requests require a fresh proposal before entering the new execution gate.</p>}{planApprovals.map(p => <div className="plan-approval-record" key={p.plan_sha256}><span className={`badge ${p.state === "approved" ? "good" : "warn"}`}>{p.state}</span><strong>{p.change_number}</strong><code>{p.plan_sha256}</code><small>Exact saved plan · {p.approver_email ?? "Independent approval pending"} · expires {formatDate(p.expires_at)}</small></div>)}</section>
+          {request.capability!=="incident_triage"&&<RequestAssurance request={request} receipt={receipt} checks={executionChecks} plans={planApprovals} verification={verification} native={nativeAssessments[0]??null} canAnalyze={mine||["platform_admin","auditor"].includes(context.role)} admin={context.role==="platform_admin"} auditor={["platform_admin","auditor"].includes(context.role)}/>}
           <div className="card card-pad">
             <h3>Reason given</h3>
             <p style={{ color: "var(--text-2)" }}>{request.justification}</p>
