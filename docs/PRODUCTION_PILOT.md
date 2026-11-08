@@ -5,6 +5,13 @@ access prevention and uniform bucket-level access must remain enabled. Do not pu
 production data in the bucket. The beneficiary must sign in and have an active
 Aegis membership. A coordinator is not an approver.
 
+An explicitly authorized deployment operator may initiate the request through the
+trusted administrative API on behalf of an active member. The request still begins
+at policy evaluation. Its immutable submission event records a null human actor,
+`submission_origin=authorized_operator`, the source role, and separate owner and
+beneficiary IDs. A user-session submission records the authenticated user instead.
+Operator initiation does not create an approval or mint a beneficiary session.
+
 ## Preconditions
 
 - Main-branch CI passes and the protected GitHub workflow has reached the gate

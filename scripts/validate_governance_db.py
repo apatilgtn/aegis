@@ -12,7 +12,7 @@ import psycopg2
 
 def validate(connection):
     with connection.cursor() as cur:
-        for path in sorted([*Path('supabase/migrations').glob('2026110613*.sql'), *Path('supabase/migrations').glob('20261108*.sql')]):
+        for path in sorted([*Path('supabase/migrations').glob('2026110613*.sql'), *Path('supabase/migrations').glob('20261108*.sql'), *Path('supabase/migrations').glob('20261109*.sql')]):
             cur.execute("select 1 from information_schema.tables where table_schema='supabase_migrations' and table_name='schema_migrations'")
             exists = cur.fetchone()
             if exists:

@@ -47,6 +47,7 @@ export default async function RequestPage({ params }: { params: Promise<{ id: st
   if (!found) notFound();
   const { monitor, request, events, findings, verification, receipt, planApprovals, changeContext, executionChecks, nativeAssessments } = found;
   const mine = request.requesterId === context.userId;
+  const operatorInitiated=events.find(e=>e.type==="request.submitted")?.payload.submission_origin==="authorized_operator";
 
   return (
     <>
@@ -80,6 +81,7 @@ export default async function RequestPage({ params }: { params: Promise<{ id: st
         </div>
       </div>
 
+      {operatorInitiated&&<div className="workflow-note" style={{marginBottom:20}}><p><strong>Operator-initiated request.</strong> A trusted deployment operator submitted this for the registered request owner. Human approvals are recorded separately and remain required.</p></div>}
       <div className="grid-main">
         <div style={{ display: "grid", gap: 16 }}>
           <div className="note">
